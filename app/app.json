@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "Where Is My Money",
+    "slug": "where-is-my-money",
+    "scheme": "whereismymoney",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true
+    },
+    "newArchEnabled": true
+  }
+}
