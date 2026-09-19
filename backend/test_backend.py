@@ -360,7 +360,11 @@ def test_elevenlabs_transcription_uses_mocked_http(monkeypatch, tmp_path) -> Non
         captured["headers"] = kwargs.get("headers")
         captured["data"] = kwargs.get("data")
         captured["files"] = kwargs.get("files")
-        return httpx.Response(200, json={"text": "spent fourteen bucks on lunch"})
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"text": "spent fourteen bucks on lunch"},
+        )
 
     monkeypatch.setattr("httpx.post", fake_post)
     text, engine = transcribe_audio(audio, source="voice")
@@ -402,7 +406,11 @@ def test_elevenlabs_http_error_falls_back_to_stub(monkeypatch, tmp_path) -> None
     audio.write_bytes(b"ID3fake-audio-bytes")
 
     def fake_post(url, **kwargs):
-        return httpx.Response(401, json={"detail": "invalid api key"})
+        return httpx.Response(
+            401,
+            request=httpx.Request("POST", url),
+            json={"detail": "invalid api key"},
+        )
 
     monkeypatch.setattr("httpx.post", fake_post)
     text, engine = transcribe_audio(audio, source="voice")
