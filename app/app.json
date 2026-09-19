@@ -15,6 +15,13 @@
         {
           "microphonePermission": "Allow Where Is My Money to record expense descriptions."
         }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Allow Where Is My Money to take pictures of receipts.",
+          "photosPermission": "Allow Where Is My Money to select receipt pictures."
+        }
       ]
     ],
     "newArchEnabled": true
