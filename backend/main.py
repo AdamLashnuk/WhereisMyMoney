@@ -11,7 +11,7 @@ import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -30,6 +30,7 @@ from db import (
     get_settings,
     has_successful_call,
     init_db,
+    insert_expense,
     list_expenses,
     local_now,
     log_call,
@@ -38,7 +39,6 @@ from db import (
     sunday_week_start,
     week_total_for_category,
     week_totals,
-    insert_expense,
 )
 from twilio_client import place_call, twilio_configured
 from whisper_client import transcribe_audio, whisper_stub_enabled
@@ -248,13 +248,13 @@ async def validation_handler(_request: Request, exc: RequestValidationError) -> 
     return JSONResponse(status_code=422, content={"ok": False, "error": "Validation error", "detail": exc.errors()})
 
 
+@app.exception_handler(HTTPException)
+async def http_error_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"ok": False, "error": exc.detail})
+
+
 @app.exception_handler(Exception)
 async def unhandled_handler(_request: Request, exc: Exception) -> JSONResponse:
-    if isinstance(exc, HTTPException):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"ok": False, "error": exc.detail},
-        )
     logger.exception("Unhandled error")
     return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
 

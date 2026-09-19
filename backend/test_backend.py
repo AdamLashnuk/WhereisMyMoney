@@ -145,7 +145,9 @@ def test_settings_and_trigger_call() -> None:
         assert body["ok"] is False
 
         missing = client.post("/trigger-call", json={"kind": "over_limit"})
-        assert missing.status_code == 422
+        assert missing.status_code == 400
+        err = missing.json()
+        assert "category" in str(err.get("error") or err.get("detail") or err)
 
         over = client.post("/trigger-call", json={"kind": "over_limit", "category": "Food"})
         assert over.status_code == 200
