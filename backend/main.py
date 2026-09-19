@@ -41,6 +41,8 @@ from db import (
     week_totals,
 )
 from twilio_client import (
+    CALL_AUDIO_MEDIA_TYPE,
+    call_audio_filename,
     call_audio_path,
     is_call_audio_token,
     place_call,
@@ -76,10 +78,10 @@ def _nemotron_configured() -> bool:
 
 
 def over_limit_speech(category: str, week_total: int, limit: int, over_by: int) -> str:
+    # Keep the phone script short (~15 words). Callers still pass week_total
+    # for the function signature; Nemotron only needs category/limit/over_by.
     fallback = (
         f"This is Where Is My Money. You went over your {category} limit. "
-        f"You spent {cents_to_speech(week_total)}. "
-        f"Your limit is {cents_to_speech(limit)}. "
         f"You are over by {cents_to_speech(over_by)}."
     )
     if not _nemotron_configured():
@@ -100,16 +102,21 @@ def weekly_summary_speech(
     week_total: int,
     last_week_totals: dict[str, int] | None = None,
 ) -> str:
-    parts = [
-        "This is Where Is My Money with your weekly summary.",
-        f"You spent {cents_to_speech(week_total)} this week.",
-    ]
-    for category in CATEGORIES:
-        amount = totals.get(category, 0)
-        if amount:
-            parts.append(f"{category}: {cents_to_speech(amount)}.")
+    # Phone audio degrades on long scripts — speak a short intro + the top
+    # category only. Person C's weekly_pattern_sentence is appended unchanged.
     if week_total == 0:
-        parts.append("No expenses logged this week.")
+        parts = [
+            "This is Where Is My Money with your weekly summary.",
+            "No expenses logged this week.",
+        ]
+    else:
+        parts = [
+            "This is Where Is My Money with your weekly summary.",
+            f"You spent {cents_to_speech(week_total)} this week.",
+        ]
+        top_category = max(CATEGORIES, key=lambda category: totals.get(category, 0))
+        if totals.get(top_category, 0):
+            parts.append(f"Mostly on {top_category}.")
     base = " ".join(parts)
     if not _nemotron_configured():
         return base
@@ -326,19 +333,23 @@ def _play_twiml_response(token: str, request: Request) -> Response:
 
 @app.api_route("/twiml/play/{token}", methods=["GET", "POST"])
 def twiml_play(token: str, request: Request) -> Response:
-    """First-party TwiML for Twilio: <Play> the cached ElevenLabs mp3."""
+    """First-party TwiML for Twilio: <Play> the cached ElevenLabs μ-law audio."""
     return _play_twiml_response(token, request)
 
 
-@app.get("/call-audio/{token}.mp3")
+@app.get("/call-audio/{token}.ulaw")
 def serve_call_audio(token: str) -> FileResponse:
-    """Public mp3 Twilio fetches after our TwiML <Play>."""
+    """Public 8 kHz μ-law file Twilio fetches after our TwiML <Play>."""
     if not is_call_audio_token(token):
         raise HTTPException(status_code=404, detail="Unknown call audio")
     path = call_audio_path(token)
     if path is None or not path.is_file():
         raise HTTPException(status_code=404, detail="Unknown call audio")
-    return FileResponse(path, media_type="audio/mpeg", filename=f"{token}.mp3")
+    return FileResponse(
+        path,
+        media_type=CALL_AUDIO_MEDIA_TYPE,
+        filename=call_audio_filename(token),
+    )
 
 
 async def _read_upload(file: UploadFile | None) -> tuple[bytes, str]:

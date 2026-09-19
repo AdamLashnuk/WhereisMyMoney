@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from categorizer import UnknownAmountError, parse_expense  # noqa: E402
 from db import (  # noqa: E402
+    CATEGORIES,
     configure_db,
     has_successful_call,
     init_db,
@@ -319,6 +320,7 @@ def test_over_limit_speech_uses_nemotron_and_falls_back(monkeypatch) -> None:
     template = over_limit_speech("Food", 1400, 1000, 400)
     assert "Food" in template
     assert "over by" in template.lower()
+    assert len(template.split()) <= 40
 
     monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
     monkeypatch.setattr(
@@ -341,6 +343,11 @@ def test_weekly_summary_appends_nemotron_pattern(monkeypatch) -> None:
     os.environ.pop("NVIDIA_API_KEY", None)
     base = weekly_summary_speech(totals, 1400)
     assert "Food" in base
+    assert len(base.split()) <= 40
+    long_totals = {category: 1000 for category in CATEGORIES}
+    long_base = weekly_summary_speech(long_totals, 6000)
+    assert len(long_base.split()) <= 40
+    assert long_base.count("dollars") <= 2
 
     monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
     monkeypatch.setattr(
@@ -465,11 +472,11 @@ def test_elevenlabs_tts_posts_victoria_voice(monkeypatch, tmp_path) -> None:
     import ai.elevenlabs_tts as tts
 
     monkeypatch.setenv("ELEVENLABS_API_KEY", "test-elevenlabs-key")
-    out = tmp_path / "victoria.mp3"
+    out = tmp_path / "victoria.ulaw"
     captured: dict[str, object] = {}
 
     class FakeResponse:
-        content = b"ID3victoria"
+        content = b"\x00\x01ulaw"
 
         def raise_for_status(self) -> None:
             return None
@@ -478,12 +485,14 @@ def test_elevenlabs_tts_posts_victoria_voice(monkeypatch, tmp_path) -> None:
         captured["url"] = url
         captured["headers"] = kwargs.get("headers")
         captured["json"] = kwargs.get("json")
+        captured["params"] = kwargs.get("params")
         return FakeResponse()
 
     monkeypatch.setattr(requests, "post", fake_post)
     assert tts.text_to_speech("You went over your Food limit.", str(out)) is True
-    assert out.read_bytes() == b"ID3victoria"
+    assert out.read_bytes() == b"\x00\x01ulaw"
     assert captured["url"] == "https://api.elevenlabs.io/v1/text-to-speech/XoUkt2bf6DlvSzRmvA8X"
+    assert captured["params"] == {"output_format": "ulaw_8000"}
     assert captured["headers"] == {
         "xi-api-key": "test-elevenlabs-key",
         "Content-Type": "application/json",
@@ -492,8 +501,12 @@ def test_elevenlabs_tts_posts_victoria_voice(monkeypatch, tmp_path) -> None:
     assert isinstance(payload, dict)
     assert payload["text"] == "You went over your Food limit."
     assert payload["model_id"] == "eleven_multilingual_v2"
+    assert payload["voice_settings"]["stability"] == 0.65
+    assert tts.VOICE_ID == "XoUkt2bf6DlvSzRmvA8X"
+    assert tts.AUDIO_EXTENSION == ".ulaw"
+    assert tts.AUDIO_MEDIA_TYPE == "audio/x-mulaw"
 
-    result = tts.get_call_audio("again", str(tmp_path / "again.mp3"))
+    result = tts.get_call_audio("again", str(tmp_path / "again.ulaw"))
     assert result["success"] is True
 
 
@@ -514,7 +527,7 @@ def test_place_call_plays_elevenlabs_audio_via_twiml_url(monkeypatch, tmp_path) 
     def fake_success(sentence, output_path):
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"ID3fake-victoria")
+        path.write_bytes(b"\x00\x01ulaw")
         return {"success": True, "audio_path": output_path}
 
     monkeypatch.setattr("twilio_client.get_call_audio", fake_success)
@@ -527,24 +540,29 @@ def test_place_call_plays_elevenlabs_audio_via_twiml_url(monkeypatch, tmp_path) 
     token = url.rsplit("/", 1)[-1]
     audio = call_audio_path(token)
     assert audio is not None and audio.is_file()
-    assert audio.read_bytes() == b"ID3fake-victoria"
+    assert audio.suffix == ".ulaw"
+    assert audio.read_bytes() == b"\x00\x01ulaw"
 
     with TestClient(app) as client:
         twiml = client.get(f"/twiml/play/{token}")
         assert twiml.status_code == 200
         body = twiml.text
         assert "<Play>" in body
-        assert f"https://demo.ngrok-free.app/call-audio/{token}.mp3" in body
+        assert f"https://demo.ngrok-free.app/call-audio/{token}.ulaw" in body
+        assert ".mp3" not in body
         assert "<Say>" not in body
 
         posted = client.post(f"/twiml/play/{token}")
         assert posted.status_code == 200
-        assert f"/call-audio/{token}.mp3" in posted.text
+        assert f"/call-audio/{token}.ulaw" in posted.text
 
-        mp3 = client.get(f"/call-audio/{token}.mp3")
-        assert mp3.status_code == 200
-        assert mp3.content == b"ID3fake-victoria"
-        assert "audio/mpeg" in (mp3.headers.get("content-type") or "")
+        ulaw = client.get(f"/call-audio/{token}.ulaw")
+        assert ulaw.status_code == 200
+        assert ulaw.content == b"\x00\x01ulaw"
+        content_type = ulaw.headers.get("content-type") or ""
+        assert "audio/x-mulaw" in content_type
+
+        assert client.get(f"/call-audio/{token}.mp3").status_code == 404
 
 
 def test_place_call_falls_back_to_twimlets_when_elevenlabs_fails(monkeypatch, tmp_path) -> None:
@@ -572,7 +590,7 @@ def test_place_call_falls_back_to_twimlets_without_public_base_url(monkeypatch, 
     def fake_success(sentence, output_path):
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"ID3fake-victoria")
+        path.write_bytes(b"\x00\x01ulaw")
         return {"success": True, "audio_path": output_path}
 
     monkeypatch.setattr("twilio_client.get_call_audio", fake_success)
@@ -590,6 +608,7 @@ def test_call_audio_unknown_token_is_404(tmp_path, monkeypatch) -> None:
     call_audio_dir()
     with TestClient(app) as client:
         missing = "0" * 32
+        assert client.get(f"/call-audio/{missing}.ulaw").status_code == 404
         assert client.get(f"/call-audio/{missing}.mp3").status_code == 404
         assert client.get(f"/twiml/play/{missing}").status_code == 404
         assert client.get("/twiml/play/../secret").status_code == 404

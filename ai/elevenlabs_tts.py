@@ -3,6 +3,9 @@
 Soft-loads ``ELEVENLABS_API_KEY`` so a missing key never crashes FastAPI boot.
 Person B should call ``get_call_audio`` and fall back to Twilio/Twimlets
 ``<Say>`` when ``success`` is False.
+
+Telephony: request ``ulaw_8000`` (8 kHz μ-law) so Twilio ``<Play>`` can send
+native phone audio instead of re-encoding a default MP3 down to 8 kHz.
 """
 
 from dotenv import load_dotenv
@@ -11,6 +14,10 @@ import os
 load_dotenv()
 
 VOICE_ID = "XoUkt2bf6DlvSzRmvA8X"  # Victoria
+OUTPUT_FORMAT = "ulaw_8000"
+AUDIO_EXTENSION = ".ulaw"
+# Twilio <Play> lists audio/ulaw; many Twilio guides also accept audio/x-mulaw.
+AUDIO_MEDIA_TYPE = "audio/x-mulaw"
 TTS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
 
 
@@ -30,8 +37,8 @@ ELEVENLABS_API_KEY = elevenlabs_api_key()
 
 def text_to_speech(sentence, output_path):
     """
-    Turns a sentence into an audio file, saved at output_path (e.g. "demo/weekly_call.mp3").
-    Returns True on success, False on failure.
+    Turns a sentence into a telephony μ-law file at output_path
+    (e.g. "demo/weekly_call.ulaw"). Returns True on success, False on failure.
     """
     api_key = elevenlabs_api_key()
     if not api_key:
@@ -52,13 +59,22 @@ def text_to_speech(sentence, output_path):
         "text": sentence,
         "model_id": "eleven_multilingual_v2",
         "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75
+            # Slightly higher stability than the default 0.5 — clearer on 8 kHz
+            # phone audio without switching to a flash/turbo model.
+            "stability": 0.65,
+            "similarity_boost": 0.75,
+            "use_speaker_boost": True,
         }
     }
 
     try:
-        response = requests.post(TTS_URL, json=payload, headers=headers, timeout=15)
+        response = requests.post(
+            TTS_URL,
+            params={"output_format": OUTPUT_FORMAT},
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
         response.raise_for_status()
         with open(output_path, "wb") as f:
             f.write(response.content)
