@@ -11,7 +11,7 @@ async function request(path, options = {}) {
     return data;
   } catch (error) {
     if (error instanceof TypeError || error.message === 'Network request failed') {
-      throw new Error('Cannot reach Sebastian’s backend. Make sure both phones and the server are on the same Wi-Fi.');
+      throw new Error('Cannot reach the backend. Check that your iPhone and Sebastian’s server are on the same Wi-Fi.');
     }
     throw error;
   }
@@ -30,11 +30,21 @@ export const getLimits = () => request('/limits');
 export const saveLimit = (category, limitCents) => postJSON('/limits', { category, limitCents });
 export const getSettings = () => request('/settings');
 export const saveSettings = (settings) => postJSON('/settings', settings);
+export const getHealth = () => request('/health');
+export const triggerWeeklyCall = () => postJSON('/trigger-call', { kind: 'weekly_summary' });
 
 export function logTextExpense(text) {
   const form = new FormData();
   form.append('source', 'voice');
   form.append('text', text);
-  // React Native sets the multipart boundary; do not set Content-Type manually.
+  return request('/log-expense', { method: 'POST', body: form });
+}
+
+export function logVoiceExpense(uri) {
+  if (!uri) throw new Error('Recording was empty. Please try again.');
+  const form = new FormData();
+  form.append('source', 'voice');
+  form.append('file', { uri, name: 'expense.m4a', type: 'audio/mp4' });
+  // React Native supplies the multipart boundary. Do not set Content-Type.
   return request('/log-expense', { method: 'POST', body: form });
 }
