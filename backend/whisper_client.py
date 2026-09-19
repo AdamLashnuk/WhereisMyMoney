@@ -1,0 +1,98 @@
+"""Audio → text.
+
+Tries a real transcriber when ``WHISPER_STUB`` is not ``1``:
+1. OpenAI Whisper API if ``OPENAI_API_KEY`` is set and the ``openai`` package exists
+2. Local ``whisper`` (openai-whisper) if installed
+
+Falls back to a deterministic stub so the server never crashes without a model.
+Set ``WHISPER_STUB=1`` to force the stub (recommended for laptop demos).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+
+logger = logging.getLogger("whereismymoney.whisper")
+
+STUB_VOICE_TEXT = "spent fourteen bucks on lunch"
+STUB_RECEIPT_TEXT = "RECEIPT TOTAL 14.00 LUNCH"
+
+
+def whisper_stub_enabled() -> bool:
+    return os.getenv("WHISPER_STUB", "").strip() in {"1", "true", "True", "yes", "YES"}
+
+
+def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, str]:
+    """Return ``(text, engine)`` where engine is ``stub``, ``openai``, or ``local``.
+
+    Never raises on missing models or keys — returns the stub instead.
+    """
+    fallback = STUB_VOICE_TEXT if source == "voice" else STUB_RECEIPT_TEXT
+    if whisper_stub_enabled():
+        logger.info("WHISPER_STUB=1 — skipping real transcription")
+        return fallback, "stub"
+
+    audio_path = Path(path)
+    if not audio_path.is_file() or audio_path.stat().st_size == 0:
+        logger.warning("No audio bytes at %s; using stub", audio_path)
+        return fallback, "stub"
+
+    text = _try_openai(audio_path)
+    if text:
+        return text, "openai"
+
+    text = _try_local_whisper(audio_path)
+    if text:
+        return text, "local"
+
+    logger.info("No Whisper backend available; using stub transcription")
+    return fallback, "stub"
+
+
+def _try_openai(path: Path) -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+    except ImportError:
+        logger.info("openai package not installed; skip OpenAI Whisper")
+        return None
+    try:
+        client = OpenAI(api_key=api_key)
+        with path.open("rb") as handle:
+            result = client.audio.transcriptions.create(model="whisper-1", file=handle)
+        text = (getattr(result, "text", None) or "").strip()
+        return text or None
+    except Exception as exc:  # pragma: no cover - network / API failures
+        logger.warning("OpenAI Whisper failed: %s", exc)
+        return None
+
+
+def _try_local_whisper(path: Path) -> str | None:
+    try:
+        import whisper
+    except ImportError:
+        return None
+    try:
+        model_name = os.getenv("WHISPER_MODEL", "base")
+        model = _load_local_model(whisper, model_name)
+        result = model.transcribe(str(path))
+        text = (result.get("text") or "").strip()
+        return text or None
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Local Whisper failed: %s", exc)
+        return None
+
+
+_local_model = None
+
+
+def _load_local_model(whisper_mod, model_name: str):
+    global _local_model
+    if _local_model is None:
+        logger.info("Loading local Whisper model %s", model_name)
+        _local_model = whisper_mod.load_model(model_name)
+    return _local_model
