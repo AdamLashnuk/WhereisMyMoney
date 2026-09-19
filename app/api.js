@@ -48,3 +48,23 @@ export function logVoiceExpense(uri) {
   // React Native supplies the multipart boundary. Do not set Content-Type.
   return request('/log-expense', { method: 'POST', body: form });
 }
+
+export function logReceiptText(text) {
+  if (!text.trim()) throw new Error('Enter the receipt details first.');
+  const form = new FormData();
+  form.append('source', 'receipt');
+  form.append('text', text.trim());
+  return request('/log-expense', { method: 'POST', body: form });
+}
+
+export function logReceiptPhoto(photo) {
+  if (!photo?.uri) throw new Error('Take a receipt photo first.');
+  const form = new FormData();
+  form.append('source', 'receipt');
+  form.append('file', {
+    uri: photo.uri,
+    name: photo.fileName || 'receipt.jpg',
+    type: photo.mimeType || 'image/jpeg',
+  });
+  return request('/log-expense', { method: 'POST', body: form });
+}
