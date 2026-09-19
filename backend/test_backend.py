@@ -14,6 +14,8 @@ os.environ.pop("TWILIO_AUTH_TOKEN", None)
 os.environ.pop("TWILIO_PHONE_NUMBER", None)
 os.environ.pop("MY_PHONE_NUMBER", None)
 os.environ.pop("NVIDIA_API_KEY", None)
+os.environ.pop("ELEVENLABS_API_KEY", None)
+os.environ.pop("OPENAI_API_KEY", None)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -28,6 +30,11 @@ from db import (  # noqa: E402
 )
 from main import app, over_limit_speech, weekly_summary_speech  # noqa: E402
 from twilio_client import place_call  # noqa: E402
+from whisper_client import (  # noqa: E402
+    ELEVENLABS_STT_URL,
+    STUB_VOICE_TEXT,
+    transcribe_audio,
+)
 
 # load_dotenv in main.py may restore NVIDIA_API_KEY from a local .env
 os.environ.pop("NVIDIA_API_KEY", None)
@@ -333,3 +340,71 @@ def test_weekly_summary_appends_nemotron_pattern(monkeypatch) -> None:
     spoken = weekly_summary_speech(totals, 1400, last_week_totals={**totals, "Food": 100})
     assert spoken.startswith(base)
     assert "jumped" in spoken
+
+
+def test_elevenlabs_transcription_uses_mocked_http(monkeypatch, tmp_path) -> None:
+    import httpx
+
+    monkeypatch.setenv("WHISPER_STUB", "0")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-elevenlabs-key")
+    monkeypatch.setenv("ELEVENLABS_STT_MODEL", "scribe_v2")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    audio = tmp_path / "sample.mp3"
+    audio.write_bytes(b"ID3fake-audio-bytes")
+
+    captured: dict[str, object] = {}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs.get("headers")
+        captured["data"] = kwargs.get("data")
+        captured["files"] = kwargs.get("files")
+        return httpx.Response(200, json={"text": "spent fourteen bucks on lunch"})
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    text, engine = transcribe_audio(audio, source="voice")
+    assert engine == "elevenlabs"
+    assert text == "spent fourteen bucks on lunch"
+    assert captured["url"] == ELEVENLABS_STT_URL
+    assert captured["headers"] == {"xi-api-key": "test-elevenlabs-key"}
+    assert captured["data"] == {"model_id": "scribe_v2", "language_code": "eng"}
+    files = captured["files"]
+    assert isinstance(files, dict)
+    assert files["file"][0] == "sample.mp3"
+
+
+def test_elevenlabs_missing_key_falls_back_to_stub(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("WHISPER_STUB", "0")
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    audio = tmp_path / "sample.mp3"
+    audio.write_bytes(b"ID3fake-audio-bytes")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("ElevenLabs HTTP should not run without a key")
+
+    monkeypatch.setattr("httpx.post", fail_if_called)
+    text, engine = transcribe_audio(audio, source="voice")
+    assert engine == "stub"
+    assert text == STUB_VOICE_TEXT
+
+
+def test_elevenlabs_http_error_falls_back_to_stub(monkeypatch, tmp_path) -> None:
+    import httpx
+
+    monkeypatch.setenv("WHISPER_STUB", "0")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-elevenlabs-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    audio = tmp_path / "sample.mp3"
+    audio.write_bytes(b"ID3fake-audio-bytes")
+
+    def fake_post(url, **kwargs):
+        return httpx.Response(401, json={"detail": "invalid api key"})
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    text, engine = transcribe_audio(audio, source="voice")
+    assert engine == "stub"
+    assert text == STUB_VOICE_TEXT

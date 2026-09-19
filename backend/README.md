@@ -35,10 +35,11 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `TWILIO_PHONE_NUMBER` | no | From-number for outbound calls |
 | `MY_PHONE_NUMBER` | no | Default destination if settings are empty |
 | `WHISPER_STUB` | no | `1` forces stub audio→text (`spent fourteen bucks on lunch`) |
-| `OPENAI_API_KEY` | no | Used when `WHISPER_STUB` is unset/`0` and `openai` is installed |
+| `ELEVENLABS_API_KEY` | no | When `WHISPER_STUB` is unset/`0`, voice files go to ElevenLabs Scribe first |
+| `ELEVENLABS_STT_MODEL` | no | Scribe model id (default `scribe_v2`) |
+| `OPENAI_API_KEY` | no | Used after ElevenLabs when `openai` is installed |
 | `WHISPER_MODEL` | no | Local openai-whisper model name (default `base`) |
 | `NVIDIA_API_KEY` | no | When set, `parse_expense` calls `ai.categorize.categorize_expense` (NVIDIA Nemotron). Missing/failed → heuristic parser. Also used for over-limit and weekly-summary call phrasing. |
-| `ELEVENLABS_API_KEY` | no | Unused by this backend |
 | `TZ` | no | Timezone for the weekly call hour (default `America/New_York`) |
 | `WHEREISMYMONEY_DB` | no | Alternate SQLite path |
 
@@ -82,6 +83,14 @@ Example without an audio file:
 curl -s -X POST http://127.0.0.1:8000/log-expense \
   -F source=voice \
   -F 'text=spent fourteen bucks on lunch'
+```
+
+Voice file (multipart field `file`). With `WHISPER_STUB=0` and `ELEVENLABS_API_KEY` set, this hits ElevenLabs Scribe:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/log-expense \
+  -F source=voice \
+  -F file=@sample.mp3
 ```
 
 ## Nemotron (Person C)

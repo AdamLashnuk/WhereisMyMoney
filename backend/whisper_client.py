@@ -1,8 +1,9 @@
 """Audio → text.
 
 Tries a real transcriber when ``WHISPER_STUB`` is not ``1``:
-1. OpenAI Whisper API if ``OPENAI_API_KEY`` is set and the ``openai`` package exists
-2. Local ``whisper`` (openai-whisper) if installed
+1. ElevenLabs Scribe if ``ELEVENLABS_API_KEY`` is set
+2. OpenAI Whisper API if ``OPENAI_API_KEY`` is set and the ``openai`` package exists
+3. Local ``whisper`` (openai-whisper) if installed
 
 Falls back to a deterministic stub so the server never crashes without a model.
 Set ``WHISPER_STUB=1`` to force the stub (recommended for laptop demos).
@@ -11,6 +12,7 @@ Set ``WHISPER_STUB=1`` to force the stub (recommended for laptop demos).
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 from pathlib import Path
 
@@ -19,13 +21,16 @@ logger = logging.getLogger("whereismymoney.whisper")
 STUB_VOICE_TEXT = "spent fourteen bucks on lunch"
 STUB_RECEIPT_TEXT = "RECEIPT TOTAL 14.00 LUNCH"
 
+ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+DEFAULT_ELEVENLABS_MODEL = "scribe_v2"
+
 
 def whisper_stub_enabled() -> bool:
     return os.getenv("WHISPER_STUB", "").strip() in {"1", "true", "True", "yes", "YES"}
 
 
 def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, str]:
-    """Return ``(text, engine)`` where engine is ``stub``, ``openai``, or ``local``.
+    """Return ``(text, engine)``: ``elevenlabs``, ``openai``, ``local``, or ``stub``.
 
     Never raises on missing models or keys — returns the stub instead.
     """
@@ -39,6 +44,10 @@ def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, s
         logger.warning("No audio bytes at %s; using stub", audio_path)
         return fallback, "stub"
 
+    text = _try_elevenlabs(audio_path)
+    if text:
+        return text, "elevenlabs"
+
     text = _try_openai(audio_path)
     if text:
         return text, "openai"
@@ -47,8 +56,39 @@ def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, s
     if text:
         return text, "local"
 
-    logger.info("No Whisper backend available; using stub transcription")
+    logger.info("No speech-to-text backend available; using stub transcription")
     return fallback, "stub"
+
+
+def _try_elevenlabs(path: Path) -> str | None:
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        import httpx
+    except ImportError:
+        logger.info("httpx package not installed; skip ElevenLabs STT")
+        return None
+    model_id = os.getenv("ELEVENLABS_STT_MODEL", "").strip() or DEFAULT_ELEVENLABS_MODEL
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    try:
+        with path.open("rb") as handle:
+            response = httpx.post(
+                ELEVENLABS_STT_URL,
+                headers={"xi-api-key": api_key},
+                data={"model_id": model_id, "language_code": "eng"},
+                files={"file": (path.name, handle, mime)},
+                timeout=60.0,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+        text = (payload.get("text") or "").strip()
+        return text or None
+    except Exception as exc:
+        logger.warning("ElevenLabs STT failed: %s", exc)
+        return None
 
 
 def _try_openai(path: Path) -> str | None:
