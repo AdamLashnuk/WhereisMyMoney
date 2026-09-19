@@ -37,9 +37,9 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `WHISPER_STUB` | no | `1` forces stub audio→text (`spent fourteen bucks on lunch`) |
 | `ELEVENLABS_API_KEY` | no | Scribe STT (when `WHISPER_STUB` is unset/`0`) **and** Victoria TTS for outbound Twilio calls (`ai/elevenlabs_tts.py`, voice id `XoUkt2bf6DlvSzRmvA8X`) |
 | `ELEVENLABS_STT_MODEL` | no | Scribe model id (default `scribe_v2`) |
-| `PUBLIC_BASE_URL` | no | Public HTTPS origin of this backend (ngrok). Required for Twilio to `<Play>` ElevenLabs mp3. Example: `https://xxxx.ngrok-free.app` (no trailing slash). Alias: `CALL_AUDIO_BASE_URL`. Localhost will not work. |
+| `PUBLIC_BASE_URL` | no | Public HTTPS origin of this backend (ngrok). Required for Twilio to `<Play>` ElevenLabs μ-law. Example: `https://xxxx.ngrok-free.app` (no trailing slash). Alias: `CALL_AUDIO_BASE_URL`. Localhost will not work. |
 | `CALL_AUDIO_BASE_URL` | no | Alias for `PUBLIC_BASE_URL` |
-| `CALL_AUDIO_DIR` | no | Directory for cached call mp3s (default `backend/call_audio/`). Files are gitignored. |
+| `CALL_AUDIO_DIR` | no | Directory for cached call μ-law files (default `backend/call_audio/`). Files are gitignored. |
 | `OPENAI_API_KEY` | no | Used after ElevenLabs when `openai` is installed |
 | `WHISPER_MODEL` | no | Local openai-whisper model name (default `base`) |
 | `NVIDIA_API_KEY` | no | When set, `parse_expense` calls `ai.categorize.categorize_expense` (NVIDIA Nemotron). Missing/failed → heuristic parser. Also used for over-limit and weekly-summary call phrasing. |
@@ -48,13 +48,25 @@ Copy the repo-root `.env.example`. Relevant keys:
 
 Missing Twilio keys: `place_call` returns `{ "ok": false }` and the API keeps serving.
 
-### Hear Victoria on `/trigger-call`
+### Hear Victoria on `/trigger-call` (re-test after the μ-law change)
+
+Do this on a laptop with Twilio + ngrok. Do **not** place a real call from a cloud VM.
 
 1. Set `ELEVENLABS_API_KEY` and Twilio keys in `.env`.
-2. Run uvicorn on port 8000, then in another terminal: `ngrok http 8000`.
-3. Set `PUBLIC_BASE_URL=https://….ngrok-free.app` (the ngrok HTTPS origin, no trailing slash) and restart uvicorn so it picks up the env.
-4. `POST /trigger-call` with `{ "kind": "weekly_summary" }` (or an over-limit kind). Twilio fetches `/twiml/play/{token}` from that public origin and `<Play>`s `/call-audio/{token}.mp3` — Victoria (`eleven_multilingual_v2`).
-5. If ElevenLabs fails **or** `PUBLIC_BASE_URL` is unset, `place_call` falls back to the trial-safe Twimlets `message` URL (Twilio `<Say>`).
+2. From `backend/`: `uvicorn main:app --reload --host 0.0.0.0 --port 8000`.
+3. In another terminal: `ngrok http 8000`.
+4. Set `PUBLIC_BASE_URL=https://….ngrok-free.app` (the ngrok HTTPS origin, no trailing slash) and restart uvicorn so it picks up the env.
+5. `POST /trigger-call` with `{ "kind": "weekly_summary" }` (or `{ "kind": "over_limit", "category": "Food" }`):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/trigger-call \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"weekly_summary"}'
+```
+
+6. Confirm the JSON `call` object has `"voice": "elevenlabs"` and a `twimlUrl` under your ngrok origin (`/twiml/play/{token}`), not `twimlets.com`.
+7. Twilio fetches that TwiML, then `<Play>`s `/call-audio/{token}.ulaw` — Victoria (`eleven_multilingual_v2`, `output_format=ulaw_8000`, `Content-Type: audio/x-mulaw`). Phone audio should be 8 kHz μ-law, not a transcoded MP3.
+8. If ElevenLabs fails **or** `PUBLIC_BASE_URL` is unset, `place_call` falls back to the trial-safe Twimlets `message` URL (Twilio `<Say>`).
 
 ## ngrok (phone app + Twilio)
 
@@ -87,8 +99,8 @@ Outbound calls that play **ElevenLabs Victoria** need ngrok (or another public H
 | `GET`/`POST` | `/settings` | `POST` body `{ callDay, callHour, phoneNumber }` |
 | `GET` | `/expenses` | Current week only |
 | `POST` | `/trigger-call` | `{ kind, category? }` |
-| `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` for Twilio (needs a cached mp3) |
-| `GET` | `/call-audio/{token}.mp3` | Cached ElevenLabs mp3 Twilio fetches after `<Play>` |
+| `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` for Twilio (needs a cached μ-law file) |
+| `GET` | `/call-audio/{token}.ulaw` | Cached ElevenLabs 8 kHz μ-law (`audio/x-mulaw`) Twilio fetches after `<Play>` |
 
 Example without an audio file:
 

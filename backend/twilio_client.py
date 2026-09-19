@@ -5,7 +5,7 @@ Missing credentials must never crash the process: ``place_call`` returns
 
 When ElevenLabs TTS succeeds and ``PUBLIC_BASE_URL`` (or ``CALL_AUDIO_BASE_URL``)
 is a public HTTPS origin, the call ``url=`` points at our first-party TwiML
-``/twiml/play/{token}`` which ``<Play>``s ``/call-audio/{token}.mp3``.
+``/twiml/play/{token}`` which ``<Play>``s ``/call-audio/{token}.ulaw``.
 
 Otherwise we fall back to a Twimlets message URL (trial-safe ``<Say>``).
 Trial accounts often reject inline ``twiml=`` on Calls.create.
@@ -32,8 +32,15 @@ if str(_REPO_ROOT) not in sys.path:
 _BACKEND_DIR = Path(__file__).resolve().parent
 _TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 
+CALL_AUDIO_EXTENSION = ".ulaw"
+CALL_AUDIO_MEDIA_TYPE = "audio/x-mulaw"
+
 try:
-    from ai.elevenlabs_tts import get_call_audio
+    from ai.elevenlabs_tts import (
+        AUDIO_EXTENSION as CALL_AUDIO_EXTENSION,
+        AUDIO_MEDIA_TYPE as CALL_AUDIO_MEDIA_TYPE,
+        get_call_audio,
+    )
 except Exception:  # pragma: no cover - module always present after this PR
     def get_call_audio(sentence, output_path):  # type: ignore[misc]
         return {"success": False, "fallback_text": sentence}
@@ -70,11 +77,15 @@ def is_call_audio_token(token: str) -> bool:
     return bool(token and _TOKEN_RE.fullmatch(token))
 
 
+def call_audio_filename(token: str) -> str:
+    return f"{token}{CALL_AUDIO_EXTENSION}"
+
+
 def call_audio_path(token: str) -> Path | None:
     if not is_call_audio_token(token):
         return None
     audio_dir = call_audio_dir().resolve()
-    path = (audio_dir / f"{token}.mp3").resolve()
+    path = (audio_dir / call_audio_filename(token)).resolve()
     try:
         path.relative_to(audio_dir)
     except ValueError:
@@ -93,7 +104,7 @@ def call_audio_public_url(token: str, *, base: str | None = None) -> str | None:
     origin = (base or public_base_url()).rstrip("/")
     if not origin:
         return None
-    return f"{origin}/call-audio/{token}.mp3"
+    return f"{origin}/call-audio/{call_audio_filename(token)}"
 
 
 def render_play_twiml(token: str, *, base: str | None = None) -> str | None:
@@ -150,7 +161,7 @@ def place_call(to: str | None, spoken_text: str) -> dict[str, Any]:
 def _outbound_twiml_url(message: str) -> tuple[str, str]:
     """Return ``(url, voice)`` — ElevenLabs Play TwiML or Twimlets Say fallback."""
     audio_token = uuid.uuid4().hex
-    output_path = call_audio_dir() / f"{audio_token}.mp3"
+    output_path = call_audio_dir() / call_audio_filename(audio_token)
     try:
         result = get_call_audio(message, str(output_path))
     except Exception as exc:
