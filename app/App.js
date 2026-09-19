@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  ActivityIndicator, Alert, Keyboard, Platform, RefreshControl, SafeAreaView,
+  ActivityIndicator, Alert, Platform, RefreshControl, SafeAreaView,
   ScrollView, StatusBar, StyleSheet, Text, TextInput, TouchableOpacity, View,
 } from 'react-native';
-import { AudioModule, RecordingPresets, setAudioModeAsync, useAudioRecorder, useAudioRecorderState } from 'expo-audio';
+import LogScreen from './LogScreen';
 import {
   getExpenses, getLimits, saveLimit, getSettings, saveSettings,
-  logTextExpense, logVoiceExpense, triggerWeeklyCall,
+  triggerWeeklyCall,
 } from './api';
 
 // Editorial banking palette. No pirate copy, credentials, or server code in this app.
@@ -68,74 +68,6 @@ function Result({ data }) {
       <Text style={s.smallBody}>{limit.action === 'placed_call' ? 'The server placed an alert call.' : limit.action === 'already_called' ? 'An alert call was already placed for this category this week.' : limit.action === 'call_failed' ? 'The server could not place the call. Check Twilio and the saved phone number.' : `Call status: ${limit.action || 'unavailable'}`}</Text>
     </View> : null}
   </>;
-}
-function LogScreen({ onLogged }) {
-  const [text, setText] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [recording, setRecording] = useState(false);
-  const [error, setError] = useState('');
-  const [result, setResult] = useState(null);
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
-  const recorderState = useAudioRecorderState(recorder);
-  const accept = (data) => {
-    if (!data?.expense) throw new Error('The server did not return an expense.');
-    setResult(data); onLogged();
-  };
-  const submitText = async () => {
-    if (!text.trim()) { setError('Describe an expense first.'); return; }
-    setBusy(true); setError(''); setResult(null);
-    try { accept(await logTextExpense(text.trim())); setText(''); Keyboard.dismiss(); }
-    catch (err) { setError(err.message || 'Could not log expense.'); }
-    finally { setBusy(false); }
-  };
-  const toggleRecording = async () => {
-    if (busy) return;
-    setError('');
-    if (!recording) {
-      setBusy(true); setResult(null);
-      try {
-        const permission = await AudioModule.requestRecordingPermissionsAsync();
-        if (!permission.granted) throw new Error('Microphone permission denied. Allow microphone access in iPhone Settings.');
-        await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-        await recorder.prepareToRecordAsync();
-        recorder.record();
-        setRecording(true);
-      } catch (err) { setError(err.message || 'Could not start microphone.'); }
-      finally { setBusy(false); }
-      return;
-    }
-    setBusy(true);
-    try {
-      await recorder.stop();
-      setRecording(false);
-      await setAudioModeAsync({ allowsRecording: false });
-      accept(await logVoiceExpense(recorder.uri));
-    } catch (err) {
-      setRecording(false);
-      setError(err.message || 'Could not upload recording. Try typed entry.');
-    } finally { setBusy(false); }
-  };
-  return <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={s.page}>
-    <Header number="01 / EXPENSES" title="Log an expense." subtitle="Capture a purchase with your voice or type it in."/>
-    <View style={s.hero}>
-      <Text style={s.smallCap}>QUICK ENTRY</Text>
-      <View style={s.heroRow}><View style={s.heroWords}><Text style={s.heroTitle}>Money in.</Text><Text style={s.heroTitle}>Details sorted.</Text></View><View style={s.coin}><Text style={s.coinText}>$</Text></View></View>
-      <View style={s.heroRule}/><Text style={s.heroFoot}>Record your purchase. We'll save the result.</Text>
-    </View>
-    <Section title="Voice entry" caption="MICROPHONE"/>
-    <View style={s.whitePanel}>
-      <Text style={s.smallBody}>{recording ? `Recording · ${Math.round((recorderState.durationMillis || 0) / 1000)} seconds` : busy ? 'Processing your expense…' : 'Tap to start. Speak naturally, then tap again to finish.'}</Text>
-      <TouchableOpacity accessibilityRole="button" accessibilityLabel={recording ? 'Stop and upload recording' : 'Start voice recording'} disabled={busy} onPress={toggleRecording} style={[s.recordButton, recording && s.recordActive, busy && s.disabled]}><Text style={s.recordIcon}>{recording ? '■' : '●'}</Text><Text style={s.recordText}>{recording ? 'Stop & log recording' : busy ? 'Please wait…' : 'Record an expense'}</Text></TouchableOpacity>
-      <Message text={error}/>
-    </View>
-    <Section title="Text entry" caption="ALTERNATIVE"/>
-    <View style={s.whitePanel}>
-      <Text style={s.fieldLabel}>EXPENSE DESCRIPTION</Text>
-      <TextInput accessibilityLabel="Expense description" multiline editable={!busy && !recording} placeholder="e.g. spent fourteen bucks on lunch" placeholderTextColor={C.muted} value={text} onChangeText={setText} style={[s.input, s.textArea]}/>
-      <Button title={busy ? 'Saving…' : 'Add expense'} disabled={busy || recording} onPress={submitText}/>
-    </View>
-    <Result data={result}/>
-  </ScrollView>;
 }
 function HistoryScreen({ revision }) {
   const [data, setData] = useState(null);
