@@ -1,7 +1,7 @@
 """Where Is My Money — FastAPI backend.
 
-Real SQLite + heuristic categorizer + optional Whisper/Twilio.
-Starts without Twilio keys. Person C is not required.
+Real SQLite + heuristic categorizer with optional NVIDIA Nemotron (Person C).
+Starts without Twilio or NVIDIA keys. Demo works offline.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from categorizer import parse_expense
+from categorizer import UnknownAmountError, parse_expense
 from db import (
     CATEGORIES,
     USER_ID,
@@ -63,16 +63,36 @@ def cents_to_speech(cents: int) -> str:
     return f"{dollars} dollars and {rem} cents"
 
 
+def _nemotron_configured() -> bool:
+    key = os.getenv("NVIDIA_API_KEY")
+    return bool(key and str(key).strip())
+
+
 def over_limit_speech(category: str, week_total: int, limit: int, over_by: int) -> str:
-    return (
+    fallback = (
         f"This is Where Is My Money. You went over your {category} limit. "
         f"You spent {cents_to_speech(week_total)}. "
         f"Your limit is {cents_to_speech(limit)}. "
         f"You are over by {cents_to_speech(over_by)}."
     )
+    if not _nemotron_configured():
+        return fallback
+    try:
+        from ai.overlimit_alert import overlimit_alert_sentence
+
+        spoken = overlimit_alert_sentence(category, limit, over_by)
+        if spoken and str(spoken).strip():
+            return str(spoken).strip()
+    except Exception:
+        logger.exception("Nemotron over-limit sentence failed; using template")
+    return fallback
 
 
-def weekly_summary_speech(totals: dict[str, int], week_total: int) -> str:
+def weekly_summary_speech(
+    totals: dict[str, int],
+    week_total: int,
+    last_week_totals: dict[str, int] | None = None,
+) -> str:
     parts = [
         "This is Where Is My Money with your weekly summary.",
         f"You spent {cents_to_speech(week_total)} this week.",
@@ -83,7 +103,19 @@ def weekly_summary_speech(totals: dict[str, int], week_total: int) -> str:
             parts.append(f"{category}: {cents_to_speech(amount)}.")
     if week_total == 0:
         parts.append("No expenses logged this week.")
-    return " ".join(parts)
+    base = " ".join(parts)
+    if not _nemotron_configured():
+        return base
+    try:
+        from ai.weekly_pattern import weekly_pattern_sentence
+
+        previous = last_week_totals if last_week_totals is not None else {c: 0 for c in CATEGORIES}
+        extra = weekly_pattern_sentence(totals, previous)
+        if extra and str(extra).strip():
+            return f"{base} {str(extra).strip()}"
+    except Exception:
+        logger.exception("Nemotron weekly pattern failed; using template")
+    return base
 
 
 def _maybe_over_limit_call(category: str) -> dict[str, Any]:
@@ -135,7 +167,8 @@ def place_weekly_summary_call(*, force: bool = False) -> dict[str, Any]:
     week_start = sunday_week_start()
     totals = week_totals(week_start=week_start)
     week_total = sum(totals.values())
-    spoken = weekly_summary_speech(totals, week_total)
+    last_week_totals = week_totals(week_start=week_start - timedelta(days=7))
+    spoken = weekly_summary_speech(totals, week_total, last_week_totals)
 
     if not force and has_successful_call("weekly_summary", None, week_start):
         return {
@@ -214,7 +247,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="Where Is My Money",
     version="1.0.0",
-    description="SteelHacks backend — SQLite, heuristic categorizer, optional Whisper + Twilio.",
+    description="SteelHacks backend — SQLite, heuristic or Nemotron categorizer, optional Whisper + Twilio.",
     lifespan=lifespan,
 )
 
@@ -267,6 +300,7 @@ def health() -> dict[str, Any]:
         "userId": USER_ID,
         "whisperStub": whisper_stub_enabled(),
         "twilioConfigured": twilio_configured(),
+        "nemotronConfigured": _nemotron_configured(),
     }
 
 
@@ -345,7 +379,7 @@ async def log_expense(
             original_text=parsed.original_text,
             source=source,
             merchant=parsed.merchant,
-            amount_cents=parsed.amount_cents,
+            amount_cents=int(parsed.amount_cents),
             category=parsed.category,
             confidence=parsed.confidence,
             needs_review=parsed.needs_review,
@@ -355,11 +389,13 @@ async def log_expense(
             "expense": expense,
             "limitCheck": limit_check,
             "parse": {
-                "engine": "heuristic",
+                "engine": parsed.engine,
                 "textEngine": engine,
-                "swap": "Replace categorizer.parse_expense with Nemotron; same ParsedExpense fields.",
+                "swap": "ai.categorize.categorize_expense when NVIDIA_API_KEY is set; heuristic fallback otherwise.",
             },
         }
+    except UnknownAmountError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as exc:

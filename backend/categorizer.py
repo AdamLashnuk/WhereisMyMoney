@@ -9,18 +9,25 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from db import CATEGORIES
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 Category = str
 
 # ---------------------------------------------------------------------------
 # SWAP INTERFACE (Person C / NVIDIA Nemotron)
 # ---------------------------------------------------------------------------
-# Replace the *body* of ``parse_expense`` (and only that). Keep this signature:
-#
-#     parse_expense(text: str) -> ParsedExpense
+# ``parse_expense(text) -> ParsedExpense`` is the only parse entry point.
+# When NVIDIA_API_KEY is set, the body calls ai.categorize.categorize_expense
+# and maps the dict onto ParsedExpense. On missing key / Nemotron failure it
+# uses the heuristic below so the demo still works offline.
 #
 # Required fields on ParsedExpense:
 #   original_text  str        unmodified input; persist forever (CONTRACT)
@@ -29,9 +36,6 @@ Category = str
 #   category       one of Food, Transport, Subscriptions, Shopping, Bills, Other
 #   confidence     float      0.0–1.0
 #   needs_review   bool       True when the model is unsure
-#
-# Use NVIDIA_API_KEY from the environment. Do not change callers in main.py.
-# Receipt OCR can feed this same function once Person C produces text.
 # ---------------------------------------------------------------------------
 
 _ONES = {
@@ -159,6 +163,13 @@ _PREPOSITION_RE = re.compile(
 )
 
 
+class UnknownAmountError(ValueError):
+    """Nemotron parsed the text but did not produce an amount in cents.
+
+    ``log-expense`` maps this to HTTP 400 so we never persist a guessed amount.
+    """
+
+
 @dataclass
 class ParsedExpense:
     original_text: str
@@ -167,6 +178,7 @@ class ParsedExpense:
     category: str
     confidence: float
     needs_review: bool
+    engine: str = "heuristic"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -281,11 +293,116 @@ def guess_merchant(text: str) -> str | None:
     return raw.title()
 
 
-def parse_expense(text: str) -> ParsedExpense:
-    """Heuristic parse. Swap this body for Nemotron — same return type.
+def _nemotron_available() -> bool:
+    key = os.getenv("NVIDIA_API_KEY")
+    return bool(key and str(key).strip())
 
-    ``NVIDIA_API_KEY`` is reserved for Person C; this function never calls it.
+
+def _coerce_cents(value) -> int | None:
+    """Integer cents only. Refuse floats that aren't whole numbers."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        cents = int(round(value))
+        if abs(value - cents) > 1e-6:
+            return None
+        return cents
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            if any(ch in stripped for ch in ".eE"):
+                number = float(stripped)
+                cents = int(round(number))
+                if abs(number - cents) > 1e-6:
+                    return None
+                return cents
+            return int(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def _from_nemotron_dict(original: str, data: dict) -> ParsedExpense:
+    amount_cents = _coerce_cents(data.get("amount_cents"))
+    if amount_cents is None:
+        raise UnknownAmountError(
+            "Could not determine an amount in cents from the text. "
+            "Please include a dollar amount and try again."
+        )
+
+    category = data.get("category")
+    if category not in CATEGORIES:
+        category = "Other"
+
+    merchant = data.get("merchant")
+    if merchant is not None:
+        merchant = str(merchant).strip() or None
+
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    needs_review = bool(data.get("needs_review", True))
+    if amount_cents < 0:
+        raise UnknownAmountError("Amount in cents must be zero or greater.")
+
+    return ParsedExpense(
+        original_text=original,
+        merchant=merchant,
+        amount_cents=int(amount_cents),
+        category=category,
+        confidence=confidence,
+        needs_review=needs_review,
+        engine="nemotron",
+    )
+
+
+def _try_nemotron_parse(original: str) -> ParsedExpense | None:
+    """Return a ParsedExpense from Nemotron, or None to use the heuristic.
+
+    Raises UnknownAmountError when Nemotron succeeded but amount_cents is null
+    so we never invent cents.
     """
+    try:
+        from ai.categorize import categorize_expense
+    except Exception:
+        return None
+
+    try:
+        data = categorize_expense(original)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    if data.get("nemotron_failed"):
+        return None
+
+    return _from_nemotron_dict(original, data)
+
+
+def parse_expense(text: str) -> ParsedExpense:
+    """Parse spoken/receipt text into a ParsedExpense.
+
+    Uses Person C's Nemotron categorizer when ``NVIDIA_API_KEY`` is set.
+    Falls back to the heuristic below if the key is missing or Nemotron fails.
+    """
+    original = text if text is not None else ""
+    if _nemotron_available():
+        nemotron = _try_nemotron_parse(original)
+        if nemotron is not None:
+            return nemotron
+    return _heuristic_parse_expense(original)
+
+
+def _heuristic_parse_expense(text: str) -> ParsedExpense:
+    """Keyword / spoken-number heuristic used when Nemotron is unavailable."""
     original = text if text is not None else ""
     cleaned = original.strip()
     if not cleaned:
@@ -326,4 +443,5 @@ def parse_expense(text: str) -> ParsedExpense:
         category=category if category in CATEGORIES else "Other",
         confidence=confidence,
         needs_review=needs_review,
+        engine="heuristic",
     )

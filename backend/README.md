@@ -1,6 +1,6 @@
 # Backend (Person B)
 
-FastAPI + SQLite for Where Is My Money. The server **starts with no Twilio keys** and does **not** require Person C (Nemotron). Money is always integer cents. The only user is `demo`.
+FastAPI + SQLite for Where Is My Money. The server **starts with no Twilio or NVIDIA keys**. Money is always integer cents. The only user is `demo`.
 
 ## Run
 
@@ -37,7 +37,7 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `WHISPER_STUB` | no | `1` forces stub audio→text (`spent fourteen bucks on lunch`) |
 | `OPENAI_API_KEY` | no | Used when `WHISPER_STUB` is unset/`0` and `openai` is installed |
 | `WHISPER_MODEL` | no | Local openai-whisper model name (default `base`) |
-| `NVIDIA_API_KEY` | no | Reserved for Person C / Nemotron — unused today |
+| `NVIDIA_API_KEY` | no | When set, `parse_expense` calls `ai.categorize.categorize_expense` (NVIDIA Nemotron). Missing/failed → heuristic parser. Also used for over-limit and weekly-summary call phrasing. |
 | `ELEVENLABS_API_KEY` | no | Unused by this backend |
 | `TZ` | no | Timezone for the weekly call hour (default `America/New_York`) |
 | `WHEREISMYMONEY_DB` | no | Alternate SQLite path |
@@ -69,7 +69,7 @@ Outbound Twilio calls use inline TwiML (`<Say>`), so ngrok is **not** required j
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/health` | `{ status: "ok", mode: "live", whisperStub, twilioConfigured }` |
+| `GET` | `/health` | `{ status: "ok", mode: "live", whisperStub, twilioConfigured, nemotronConfigured }` |
 | `POST` | `/log-expense` | `multipart/form-data`: `source=voice\|receipt`, optional `file`, optional `text` |
 | `GET`/`POST` | `/limits` | `POST` body `{ category, limitCents }` |
 | `GET`/`POST` | `/settings` | `POST` body `{ callDay, callHour, phoneNumber }` |
@@ -84,16 +84,17 @@ curl -s -X POST http://127.0.0.1:8000/log-expense \
   -F 'text=spent fourteen bucks on lunch'
 ```
 
-## Swap in Nemotron (Person C)
+## Nemotron (Person C)
 
-`categorizer.parse_expense(text) -> ParsedExpense` is the **only** parse interface.
+`categorizer.parse_expense(text) -> ParsedExpense` is the **only** parse interface `main.py` uses.
 
 1. Keep the `ParsedExpense` fields (`original_text`, `merchant`, `amount_cents`, `category`, `confidence`, `needs_review`).
-2. Replace the heuristic **body** of `parse_expense` with an NVIDIA API call using `NVIDIA_API_KEY`.
-3. Do not change `main.py` — it only calls `parse_expense`.
-4. Receipt OCR can produce text and then call the same function. Audio still goes through `whisper_client.transcribe_audio`.
+2. When `NVIDIA_API_KEY` is set, the parser calls `ai.categorize.categorize_expense` (Person C's prompt is unchanged) and maps the dict onto `ParsedExpense`.
+3. If Nemotron is down or the key is missing, the keyword heuristic still handles demo phrases.
+4. If Nemotron returns `amount_cents: null` (it understood the text but not the money), `/log-expense` returns **HTTP 400** and does **not** insert a guessed amount. Cents stay integers.
+5. Over-limit Twilio speech uses `ai.overlimit_alert.overlimit_alert_sentence`; weekly summary appends `ai.weekly_pattern.weekly_pattern_sentence`. Both keep the existing template if Nemotron fails.
 
-Until that swap, a keyword/amount heuristic handles phrases like:
+Until a key is set, a keyword/amount heuristic handles phrases like:
 
 - `spent fourteen bucks on lunch` → $14.00 Food
 - `two fifty for the bus` → $2.50 Transport
