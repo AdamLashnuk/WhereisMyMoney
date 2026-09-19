@@ -1,3 +1,1 @@
-// When Person B sends the backend URL, replace this value with their HTTPS ngrok URL.
-// Do not put secret API keys in the phone app.
-export const API_BASE_URL = '';
+export const API_BASE_URL = 'http://10.5.45.55:8000';
