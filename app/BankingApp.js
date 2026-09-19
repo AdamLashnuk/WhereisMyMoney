@@ -68,7 +68,7 @@ function LogScreen({ onLogged }) {
     <Heading kicker="01 / EXPENSES" title="Log an expense." subtitle="Keep track of every purchase, without the busywork."/>
     <View style={s.logHero}>
       <Text style={s.heroKicker}>QUICK ENTRY</Text>
-      <View style={s.heroTextRow}><Text style={s.heroTitle}>Money in.\nDetails sorted.</Text><View style={s.heroCoin}><Text style={s.coinSymbol}>$</Text></View></View>
+      <View style={s.heroTextRow}><Text style={s.heroTitle}>Money in.Details sorted.</Text><View style={s.heroCoin}><Text style={s.coinSymbol}>$</Text></View></View>
       <View style={s.heroFoot}><View style={s.heroFootLine}/><Text style={s.heroFootText}>Voice recording and receipts coming soon</Text></View>
     </View>
     <SectionTitle title="New expense" detail="TEXT ENTRY"/>
