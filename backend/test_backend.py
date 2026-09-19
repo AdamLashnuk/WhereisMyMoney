@@ -16,6 +16,9 @@ os.environ.pop("MY_PHONE_NUMBER", None)
 os.environ.pop("NVIDIA_API_KEY", None)
 os.environ.pop("ELEVENLABS_API_KEY", None)
 os.environ.pop("OPENAI_API_KEY", None)
+os.environ.pop("PUBLIC_BASE_URL", None)
+os.environ.pop("CALL_AUDIO_BASE_URL", None)
+os.environ.pop("CALL_AUDIO_DIR", None)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -29,15 +32,22 @@ from db import (  # noqa: E402
     sunday_week_start,
 )
 from main import app, over_limit_speech, weekly_summary_speech  # noqa: E402
-from twilio_client import place_call  # noqa: E402
+from twilio_client import (  # noqa: E402
+    call_audio_dir,
+    call_audio_path,
+    place_call,
+)
 from whisper_client import (  # noqa: E402
     ELEVENLABS_STT_URL,
     STUB_VOICE_TEXT,
     transcribe_audio,
 )
 
-# load_dotenv in main.py may restore NVIDIA_API_KEY from a local .env
+# load_dotenv in main.py may restore keys from a local .env
 os.environ.pop("NVIDIA_API_KEY", None)
+os.environ.pop("PUBLIC_BASE_URL", None)
+os.environ.pop("CALL_AUDIO_BASE_URL", None)
+os.environ.pop("ELEVENLABS_API_KEY", None)
 
 
 def _fresh_db() -> None:
@@ -416,3 +426,170 @@ def test_elevenlabs_http_error_falls_back_to_stub(monkeypatch, tmp_path) -> None
     text, engine = transcribe_audio(audio, source="voice")
     assert engine == "stub"
     assert text == STUB_VOICE_TEXT
+
+
+def _twilio_env(monkeypatch, tmp_path, **extra: str | None) -> None:
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACtestaccountsid")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("TWILIO_PHONE_NUMBER", "+15551111111")
+    monkeypatch.setenv("CALL_AUDIO_DIR", str(tmp_path / "call_audio"))
+    for key, value in extra.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+
+def _install_fake_twilio(monkeypatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    class FakeCall:
+        sid = "CAffffffffffffffffffffffffffffffff"
+
+    class FakeCalls:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeCall()
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            self.calls = FakeCalls()
+
+    monkeypatch.setattr("twilio.rest.Client", FakeClient)
+    return captured
+
+
+def test_elevenlabs_tts_posts_victoria_voice(monkeypatch, tmp_path) -> None:
+    import requests
+
+    import ai.elevenlabs_tts as tts
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-elevenlabs-key")
+    out = tmp_path / "victoria.mp3"
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        content = b"ID3victoria"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs.get("headers")
+        captured["json"] = kwargs.get("json")
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    assert tts.text_to_speech("You went over your Food limit.", str(out)) is True
+    assert out.read_bytes() == b"ID3victoria"
+    assert captured["url"] == "https://api.elevenlabs.io/v1/text-to-speech/XoUkt2bf6DlvSzRmvA8X"
+    assert captured["headers"] == {
+        "xi-api-key": "test-elevenlabs-key",
+        "Content-Type": "application/json",
+    }
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload["text"] == "You went over your Food limit."
+    assert payload["model_id"] == "eleven_multilingual_v2"
+
+    result = tts.get_call_audio("again", str(tmp_path / "again.mp3"))
+    assert result["success"] is True
+
+
+def test_elevenlabs_tts_import_without_key_does_not_crash(monkeypatch) -> None:
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    import ai.elevenlabs_tts as tts
+
+    assert tts.elevenlabs_api_key() is None
+    assert tts.text_to_speech("hello", "/tmp/unused.mp3") is False
+    result = tts.get_call_audio("hello", "/tmp/unused.mp3")
+    assert result == {"success": False, "fallback_text": "hello"}
+
+
+def test_place_call_plays_elevenlabs_audio_via_twiml_url(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    captured = _install_fake_twilio(monkeypatch)
+
+    def fake_success(sentence, output_path):
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ID3fake-victoria")
+        return {"success": True, "audio_path": output_path}
+
+    monkeypatch.setattr("twilio_client.get_call_audio", fake_success)
+    result = place_call("+15555550100", "You went over your Food limit.")
+    assert result["ok"] is True
+    assert result["voice"] == "elevenlabs"
+    url = str(captured["url"])
+    assert url.startswith("https://demo.ngrok-free.app/twiml/play/")
+    assert "twimlets.com" not in url
+    token = url.rsplit("/", 1)[-1]
+    audio = call_audio_path(token)
+    assert audio is not None and audio.is_file()
+    assert audio.read_bytes() == b"ID3fake-victoria"
+
+    with TestClient(app) as client:
+        twiml = client.get(f"/twiml/play/{token}")
+        assert twiml.status_code == 200
+        body = twiml.text
+        assert "<Play>" in body
+        assert f"https://demo.ngrok-free.app/call-audio/{token}.mp3" in body
+        assert "<Say>" not in body
+
+        posted = client.post(f"/twiml/play/{token}")
+        assert posted.status_code == 200
+        assert f"/call-audio/{token}.mp3" in posted.text
+
+        mp3 = client.get(f"/call-audio/{token}.mp3")
+        assert mp3.status_code == 200
+        assert mp3.content == b"ID3fake-victoria"
+        assert "audio/mpeg" in (mp3.headers.get("content-type") or "")
+
+
+def test_place_call_falls_back_to_twimlets_when_elevenlabs_fails(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    captured = _install_fake_twilio(monkeypatch)
+
+    def fake_failure(sentence, output_path):
+        return {"success": False, "fallback_text": sentence}
+
+    monkeypatch.setattr("twilio_client.get_call_audio", fake_failure)
+    result = place_call("+15555550100", "Weekly summary: you spent fourteen dollars.")
+    assert result["ok"] is True
+    assert result["voice"] == "twimlets"
+    url = str(captured["url"])
+    assert url.startswith("https://twimlets.com/message?")
+    assert "fourteen" in url
+
+
+def test_place_call_falls_back_to_twimlets_without_public_base_url(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("CALL_AUDIO_BASE_URL", raising=False)
+    captured = _install_fake_twilio(monkeypatch)
+
+    def fake_success(sentence, output_path):
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ID3fake-victoria")
+        return {"success": True, "audio_path": output_path}
+
+    monkeypatch.setattr("twilio_client.get_call_audio", fake_success)
+    result = place_call("+15555550100", "You went over your Food limit.")
+    assert result["ok"] is True
+    assert result["voice"] == "twimlets"
+    url = str(captured["url"])
+    assert url.startswith("https://twimlets.com/message?")
+    assert "Food" in url
+    assert "twiml/play" not in url
+
+
+def test_call_audio_unknown_token_is_404(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CALL_AUDIO_DIR", str(tmp_path / "empty_audio"))
+    call_audio_dir()
+    with TestClient(app) as client:
+        missing = "0" * 32
+        assert client.get(f"/call-audio/{missing}.mp3").status_code == 404
+        assert client.get(f"/twiml/play/{missing}").status_code == 404
+        assert client.get("/twiml/play/../secret").status_code == 404

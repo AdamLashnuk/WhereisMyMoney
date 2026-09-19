@@ -35,8 +35,11 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `TWILIO_PHONE_NUMBER` | no | From-number for outbound calls |
 | `MY_PHONE_NUMBER` | no | Default destination if settings are empty |
 | `WHISPER_STUB` | no | `1` forces stub audio→text (`spent fourteen bucks on lunch`) |
-| `ELEVENLABS_API_KEY` | no | When `WHISPER_STUB` is unset/`0`, voice files go to ElevenLabs Scribe first |
+| `ELEVENLABS_API_KEY` | no | Scribe STT (when `WHISPER_STUB` is unset/`0`) **and** Victoria TTS for outbound Twilio calls (`ai/elevenlabs_tts.py`, voice id `XoUkt2bf6DlvSzRmvA8X`) |
 | `ELEVENLABS_STT_MODEL` | no | Scribe model id (default `scribe_v2`) |
+| `PUBLIC_BASE_URL` | no | Public HTTPS origin of this backend (ngrok). Required for Twilio to `<Play>` ElevenLabs mp3. Example: `https://xxxx.ngrok-free.app` (no trailing slash). Alias: `CALL_AUDIO_BASE_URL`. Localhost will not work. |
+| `CALL_AUDIO_BASE_URL` | no | Alias for `PUBLIC_BASE_URL` |
+| `CALL_AUDIO_DIR` | no | Directory for cached call mp3s (default `backend/call_audio/`). Files are gitignored. |
 | `OPENAI_API_KEY` | no | Used after ElevenLabs when `openai` is installed |
 | `WHISPER_MODEL` | no | Local openai-whisper model name (default `base`) |
 | `NVIDIA_API_KEY` | no | When set, `parse_expense` calls `ai.categorize.categorize_expense` (NVIDIA Nemotron). Missing/failed → heuristic parser. Also used for over-limit and weekly-summary call phrasing. |
@@ -44,6 +47,14 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `WHEREISMYMONEY_DB` | no | Alternate SQLite path |
 
 Missing Twilio keys: `place_call` returns `{ "ok": false }` and the API keeps serving.
+
+### Hear Victoria on `/trigger-call`
+
+1. Set `ELEVENLABS_API_KEY` and Twilio keys in `.env`.
+2. Run uvicorn on port 8000, then in another terminal: `ngrok http 8000`.
+3. Set `PUBLIC_BASE_URL=https://….ngrok-free.app` (the ngrok HTTPS origin, no trailing slash) and restart uvicorn so it picks up the env.
+4. `POST /trigger-call` with `{ "kind": "weekly_summary" }` (or an over-limit kind). Twilio fetches `/twiml/play/{token}` from that public origin and `<Play>`s `/call-audio/{token}.mp3` — Victoria (`eleven_multilingual_v2`).
+5. If ElevenLabs fails **or** `PUBLIC_BASE_URL` is unset, `place_call` falls back to the trial-safe Twimlets `message` URL (Twilio `<Say>`).
 
 ## ngrok (phone app + Twilio)
 
@@ -55,7 +66,7 @@ ngrok http 8000
 
 Give Person A the `https://…ngrok-free.app` origin for `app/config.js` (`API_BASE_URL`). Do **not** put Twilio/NVIDIA keys in the phone app.
 
-Outbound Twilio calls use inline TwiML (`<Say>`), so ngrok is **not** required just to place a call. You only need a public URL if you later add inbound Twilio webhooks.
+Outbound calls that play **ElevenLabs Victoria** need ngrok (or another public HTTPS tunnel). Twilio cannot fetch `localhost`. Set `PUBLIC_BASE_URL` to the ngrok HTTPS origin so `place_call` can pass `url=` to `GET/POST /twiml/play/{token}`. Without that origin (or if TTS fails), calls fall back to Twimlets `<Say>` and ngrok is not required.
 
 ## Contract
 
@@ -76,6 +87,8 @@ Outbound Twilio calls use inline TwiML (`<Say>`), so ngrok is **not** required j
 | `GET`/`POST` | `/settings` | `POST` body `{ callDay, callHour, phoneNumber }` |
 | `GET` | `/expenses` | Current week only |
 | `POST` | `/trigger-call` | `{ kind, category? }` |
+| `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` for Twilio (needs a cached mp3) |
+| `GET` | `/call-audio/{token}.mp3` | Cached ElevenLabs mp3 Twilio fetches after `<Play>` |
 
 Example without an audio file:
 
