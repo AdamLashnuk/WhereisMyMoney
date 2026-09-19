@@ -2,6 +2,9 @@
 
 Missing credentials must never crash the process: ``place_call`` returns
 ``{"ok": False, ...}`` so FastAPI can still boot and serve the app.
+
+Trial accounts often reject inline ``twiml=`` on Calls.create — we use a
+Twimlets message URL instead, which works on free/trial.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
+from urllib.parse import quote
 
 logger = logging.getLogger("whereismymoney.twilio")
 
@@ -43,16 +47,18 @@ def place_call(to: str | None, spoken_text: str) -> dict[str, Any]:
 
     try:
         from twilio.rest import Client
-        from twilio.twiml.voice_response import VoiceResponse
     except ImportError:
         logger.warning("twilio package is not installed")
         return {"ok": False, "error": "twilio package is not installed"}
 
     try:
-        response = VoiceResponse()
-        response.say(spoken_text, voice="alice")
+        # Trial-safe: Twimlets serves TwiML for Say. Avoids inline twiml= which
+        # trial accounts often reject with "disallowed parameters".
+        message = (spoken_text or "Where Is My Money.").strip()[:900]
+        twiml_url = "https://twimlets.com/message?Message%5B0%5D=" + quote(message)
+
         client = Client(sid, token)
-        call = client.calls.create(to=dest, from_=from_number, twiml=str(response))
+        call = client.calls.create(to=dest, from_=from_number, url=twiml_url)
         return {"ok": True, "sid": call.sid, "to": dest}
     except Exception as exc:
         logger.warning("Twilio call failed: %s", exc)
