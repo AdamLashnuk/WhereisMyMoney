@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from categorizer import UnknownAmountError, parse_expense
@@ -40,7 +40,14 @@ from db import (
     week_total_for_category,
     week_totals,
 )
-from twilio_client import place_call, twilio_configured
+from twilio_client import (
+    call_audio_path,
+    is_call_audio_token,
+    place_call,
+    public_base_url,
+    render_play_twiml,
+    twilio_configured,
+)
 from whisper_client import transcribe_audio, whisper_stub_enabled
 
 _BACKEND_DIR = Path(__file__).resolve().parent
@@ -302,6 +309,36 @@ def health() -> dict[str, Any]:
         "twilioConfigured": twilio_configured(),
         "nemotronConfigured": _nemotron_configured(),
     }
+
+
+def _play_twiml_response(token: str, request: Request) -> Response:
+    if not is_call_audio_token(token):
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    path = call_audio_path(token)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    base = public_base_url() or str(request.base_url).rstrip("/")
+    xml = render_play_twiml(token, base=base)
+    if not xml:
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    return Response(content=xml, media_type="application/xml")
+
+
+@app.api_route("/twiml/play/{token}", methods=["GET", "POST"])
+def twiml_play(token: str, request: Request) -> Response:
+    """First-party TwiML for Twilio: <Play> the cached ElevenLabs mp3."""
+    return _play_twiml_response(token, request)
+
+
+@app.get("/call-audio/{token}.mp3")
+def serve_call_audio(token: str) -> FileResponse:
+    """Public mp3 Twilio fetches after our TwiML <Play>."""
+    if not is_call_audio_token(token):
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    path = call_audio_path(token)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    return FileResponse(path, media_type="audio/mpeg", filename=f"{token}.mp3")
 
 
 async def _read_upload(file: UploadFile | None) -> tuple[bytes, str]:
