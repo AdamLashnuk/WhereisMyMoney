@@ -12,6 +12,7 @@
     "expo": "~57.0.24",
     "expo-status-bar": "~57.0.1",
     "expo-audio": "~57.0.5",
+    "expo-image-picker": "~57.0.19",
     "react": "19.2.3",
     "react-native": "0.86.3"
   }
