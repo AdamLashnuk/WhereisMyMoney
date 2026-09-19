@@ -9,6 +9,14 @@
     "ios": {
       "supportsTablet": true
     },
+    "plugins": [
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow Where Is My Money to record expense descriptions."
+        }
+      ]
+    ],
     "newArchEnabled": true
   }
 }
