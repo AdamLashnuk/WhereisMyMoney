@@ -4,8 +4,9 @@ Money is always whole cents (integers). Exactly six categories: Food, Transport,
 
 ## Endpoints
 
-- `POST /log-expense` — voice or receipt → expense + limit check
-- `POST /limits` / `GET /limits`
+- `POST /log-expense` — voice or receipt → expense + limit check. Receipt **images** use `ai.receipt.categorize_receipt` (Nemotron vision); null `amount_cents` is HTTP 400 (no invented cents).
+- `POST /parse-limit` — JSON `{ "text": "..." }` → `{ category, amount_cents, period: "weekly", confidence }`. Does **not** save. If confidence is high and both fields are present, the app should then `POST /limits`.
+- `POST /limits` / `GET /limits` — `POST` body remains `{ category, limitCents }`
 - `POST /settings` / `GET /settings`
 - `GET /expenses`
 - `POST /trigger-call`

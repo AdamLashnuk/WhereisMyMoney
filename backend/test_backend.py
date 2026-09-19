@@ -22,7 +22,7 @@ os.environ.pop("CALL_AUDIO_DIR", None)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from categorizer import UnknownAmountError, parse_expense  # noqa: E402
+from categorizer import UnknownAmountError, parse_expense, parse_receipt_image  # noqa: E402
 from db import (  # noqa: E402
     CATEGORIES,
     configure_db,
@@ -612,3 +612,214 @@ def test_call_audio_unknown_token_is_404(tmp_path, monkeypatch) -> None:
         assert client.get(f"/call-audio/{missing}.mp3").status_code == 404
         assert client.get(f"/twiml/play/{missing}").status_code == 404
         assert client.get("/twiml/play/../secret").status_code == 404
+
+
+_FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"fake-receipt-bytes"
+
+
+def test_receipt_import_without_key_does_not_crash(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    import ai.receipt as receipt
+
+    missing = tmp_path / "nope.jpg"
+    result = receipt.categorize_receipt(str(missing))
+    assert result["amount_cents"] is None
+    assert result["needs_review"] is True
+    assert result["category"] == "Other"
+    assert result["nemotron_failed"] is True
+
+
+def test_spoken_limit_import_without_key_is_null_safe(monkeypatch) -> None:
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    from ai.spoken_limit import understand_spoken_limit
+
+    result = understand_spoken_limit("cap my food spending at a hundred a week")
+    assert result["category"] is None
+    assert result["amount_cents"] is None
+    assert result["period"] == "weekly"
+    assert result["confidence"] == 0.0
+
+
+def test_parse_receipt_image_maps_vision_dict(monkeypatch, tmp_path) -> None:
+    image = tmp_path / "chipotle.jpg"
+    image.write_bytes(_FAKE_JPEG)
+
+    def fake_receipt(image_path: str) -> dict:
+        assert Path(image_path).is_file()
+        return {
+            "original_text": "[receipt photo: chipotle.jpg]",
+            "merchant": "Chipotle",
+            "amount_cents": 1450,
+            "category": "Food",
+            "confidence": 0.91,
+            "needs_review": False,
+            "nemotron_failed": False,
+        }
+
+    monkeypatch.setattr("ai.receipt.categorize_receipt", fake_receipt)
+    parsed = parse_receipt_image(str(image), original_text="[receipt photo: chipotle.jpg]")
+    assert parsed.engine == "nemotron-vision"
+    assert parsed.amount_cents == 1450
+    assert parsed.merchant == "Chipotle"
+    assert parsed.category == "Food"
+    assert parsed.needs_review is False
+
+
+def test_log_expense_receipt_image_uses_vision(monkeypatch) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+
+    def fake_receipt(image_path: str) -> dict:
+        assert Path(image_path).is_file()
+        return {
+            "original_text": "[receipt photo: lunch.jpg]",
+            "merchant": "Chipotle",
+            "amount_cents": 1450,
+            "category": "Food",
+            "confidence": 0.91,
+            "needs_review": False,
+            "nemotron_failed": False,
+        }
+
+    monkeypatch.setattr("ai.receipt.categorize_receipt", fake_receipt)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={"source": "receipt"},
+            files={"file": ("lunch.jpg", _FAKE_JPEG, "image/jpeg")},
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert payload["parse"]["engine"] == "nemotron-vision"
+        assert payload["parse"]["textEngine"] == "receipt"
+        assert payload["expense"]["amountCents"] == 1450
+        assert payload["expense"]["category"] == "Food"
+        assert payload["expense"]["merchant"] == "Chipotle"
+        assert payload["expense"]["originalText"] == "[receipt photo: lunch.jpg]"
+        assert payload["expense"]["source"] == "receipt"
+
+
+def test_log_expense_receipt_image_null_amount_is_400(monkeypatch) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+
+    def fake_null(_image_path: str) -> dict:
+        return {
+            "original_text": "[receipt photo: blurry.jpg]",
+            "merchant": None,
+            "amount_cents": None,
+            "category": "Other",
+            "confidence": 0.2,
+            "needs_review": True,
+            "nemotron_failed": False,
+        }
+
+    monkeypatch.setattr("ai.receipt.categorize_receipt", fake_null)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={"source": "receipt"},
+            files={"file": ("blurry.jpg", _FAKE_JPEG, "image/jpeg")},
+        )
+        assert posted.status_code == 400
+        body = posted.json()
+        assert body["ok"] is False
+        assert "amount" in str(body.get("error") or "").lower()
+        history = client.get("/expenses").json()
+        assert history["weekTotalCents"] == 0
+
+
+def test_log_expense_receipt_image_does_not_use_text_stub(monkeypatch) -> None:
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    os.environ["WHISPER_STUB"] = "1"
+
+    def fail_if_text_parse(text: str):
+        raise AssertionError(f"text heuristic should not run for receipt images: {text!r}")
+
+    monkeypatch.setattr("main.parse_expense", fail_if_text_parse)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={"source": "receipt"},
+            files={"file": ("lunch.jpg", _FAKE_JPEG, "image/jpeg")},
+        )
+        assert posted.status_code == 400
+        body = posted.json()
+        assert body["ok"] is False
+        assert "amount" in str(body.get("error") or "").lower()
+
+
+def test_log_expense_receipt_text_still_uses_parser() -> None:
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={"source": "receipt", "text": "RECEIPT TOTAL 14.00 LUNCH"},
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert payload["parse"]["engine"] == "heuristic"
+        assert payload["expense"]["amountCents"] == 1400
+        assert payload["expense"]["category"] == "Food"
+
+
+def test_parse_limit_returns_spoken_dict_without_saving(monkeypatch) -> None:
+    def fake_limit(raw_text: str) -> dict:
+        assert "hundred" in raw_text
+        return {
+            "category": "Food",
+            "amount_cents": 10000,
+            "period": "weekly",
+            "confidence": 0.93,
+        }
+
+    monkeypatch.setattr("ai.spoken_limit.understand_spoken_limit", fake_limit)
+    _fresh_db()
+    with TestClient(app) as client:
+        before = client.get("/limits").json()["limits"]
+        posted = client.post(
+            "/parse-limit",
+            json={"text": "cap my food spending at a hundred a week"},
+        )
+        assert posted.status_code == 200
+        body = posted.json()
+        assert body["category"] == "Food"
+        assert body["amount_cents"] == 10000
+        assert body["period"] == "weekly"
+        assert body["confidence"] == 0.93
+        assert body["readyToSave"] is True
+        assert "/limits" in body["saveHint"]
+        after = client.get("/limits").json()["limits"]
+        assert after == before
+        assert after["Food"] == 5000
+
+        saved = client.post("/limits", json={"category": "Food", "limitCents": 10000})
+        assert saved.status_code == 200
+        assert saved.json()["limits"]["Food"] == 10000
+
+
+def test_parse_limit_null_safe_on_failure(monkeypatch) -> None:
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post("/parse-limit", json={"text": "I want to spend less this month"})
+        assert posted.status_code == 200
+        body = posted.json()
+        assert body["category"] is None
+        assert body["amount_cents"] is None
+        assert body["period"] == "weekly"
+        assert body["confidence"] == 0.0
+        assert body["readyToSave"] is False
+        assert client.get("/limits").json()["limits"]["Food"] == 5000
+
+
+def test_parse_limit_rejects_empty_text() -> None:
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post("/parse-limit", json={"text": ""})
+        assert posted.status_code == 422
+        # Existing limits body is unchanged
+        saved = client.post("/limits", json={"category": "Transport", "limitCents": 2500})
+        assert saved.status_code == 200
+        assert saved.json()["limits"]["Transport"] == 2500

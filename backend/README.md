@@ -42,7 +42,7 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `CALL_AUDIO_DIR` | no | Directory for cached call μ-law files (default `backend/call_audio/`). Files are gitignored. |
 | `OPENAI_API_KEY` | no | Used after ElevenLabs when `openai` is installed |
 | `WHISPER_MODEL` | no | Local openai-whisper model name (default `base`) |
-| `NVIDIA_API_KEY` | no | When set, `parse_expense` calls `ai.categorize.categorize_expense` (NVIDIA Nemotron). Missing/failed → heuristic parser. Also used for over-limit and weekly-summary call phrasing. |
+| `NVIDIA_API_KEY` | no | When set, `parse_expense` calls `ai.categorize.categorize_expense` (NVIDIA Nemotron) and receipt **images** call `ai.receipt.categorize_receipt` (vision). Missing/failed text → heuristic parser. Images never invent cents (HTTP 400 if `amount_cents` is null). Also used for `/parse-limit`, over-limit, and weekly-summary phrasing. |
 | `TZ` | no | Timezone for the weekly call hour (default `America/New_York`) |
 | `WHEREISMYMONEY_DB` | no | Alternate SQLite path |
 
@@ -94,8 +94,9 @@ Outbound calls that play **ElevenLabs Victoria** need ngrok (or another public H
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/health` | `{ status: "ok", mode: "live", whisperStub, twilioConfigured, nemotronConfigured }` |
-| `POST` | `/log-expense` | `multipart/form-data`: `source=voice\|receipt`, optional `file`, optional `text` |
-| `GET`/`POST` | `/limits` | `POST` body `{ category, limitCents }` |
+| `POST` | `/log-expense` | `multipart/form-data`: `source=voice\|receipt`, optional `file`, optional `text`. Receipt images → Nemotron vision (`parse.engine=nemotron-vision`, `textEngine=receipt`) |
+| `POST` | `/parse-limit` | JSON `{ text }` → `{ category, amount_cents, period, confidence, readyToSave }`. Does **not** save. If `readyToSave`, the app should `POST /limits` |
+| `GET`/`POST` | `/limits` | `POST` body `{ category, limitCents }` (unchanged) |
 | `GET`/`POST` | `/settings` | `POST` body `{ callDay, callHour, phoneNumber }` |
 | `GET` | `/expenses` | Current week only |
 | `POST` | `/trigger-call` | `{ kind, category? }` |
@@ -108,6 +109,22 @@ Example without an audio file:
 curl -s -X POST http://127.0.0.1:8000/log-expense \
   -F source=voice \
   -F 'text=spent fourteen bucks on lunch'
+```
+
+Receipt **image** (multipart field `file`). Uses Person C's vision model; HTTP 400 if the total cannot be read (no invented cents):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/log-expense \
+  -F source=receipt \
+  -F file=@sample_receipt.jpg
+```
+
+Spoken weekly limit (does not persist — follow with `POST /limits` when `readyToSave` is true):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/parse-limit \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"cap my food spending at a hundred a week"}'
 ```
 
 Voice file (multipart field `file`). With `WHISPER_STUB=0` and `ELEVENLABS_API_KEY` set, this hits ElevenLabs Scribe:
@@ -126,7 +143,9 @@ curl -s -X POST http://127.0.0.1:8000/log-expense \
 2. When `NVIDIA_API_KEY` is set, the parser calls `ai.categorize.categorize_expense` (Person C's prompt is unchanged) and maps the dict onto `ParsedExpense`.
 3. If Nemotron is down or the key is missing, the keyword heuristic still handles demo phrases.
 4. If Nemotron returns `amount_cents: null` (it understood the text but not the money), `/log-expense` returns **HTTP 400** and does **not** insert a guessed amount. Cents stay integers.
-5. Over-limit Twilio speech uses `ai.overlimit_alert.overlimit_alert_sentence`; weekly summary appends `ai.weekly_pattern.weekly_pattern_sentence`. Both keep the existing template if Nemotron fails.
+5. Receipt **images** (`source=receipt` + image `file`) call `ai.receipt.categorize_receipt` (vision model `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`). `parse.engine` is `nemotron-vision` and `textEngine` is `receipt`. Images do **not** fall back to the text heuristic — null cents → HTTP 400 + `needs_review`.
+6. `POST /parse-limit` calls `ai.spoken_limit.understand_spoken_limit` and returns Person C's dict. It does not write limits. When `readyToSave` is true, the app should `POST /limits` with `{ category, limitCents }`.
+7. Over-limit Twilio speech uses `ai.overlimit_alert.overlimit_alert_sentence`; weekly summary appends `ai.weekly_pattern.weekly_pattern_sentence`. Both keep the existing template if Nemotron fails.
 
 Until a key is set, a keyword/amount heuristic handles phrases like:
 

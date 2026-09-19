@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import tempfile
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
@@ -22,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from categorizer import UnknownAmountError, parse_expense
+from categorizer import UnknownAmountError, parse_expense, parse_receipt_image
 from db import (
     CATEGORIES,
     USER_ID,
@@ -53,6 +54,9 @@ from twilio_client import (
 from whisper_client import transcribe_audio, whisper_stub_enabled
 
 _BACKEND_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _BACKEND_DIR.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 load_dotenv(_BACKEND_DIR / ".env")
 load_dotenv(_BACKEND_DIR.parent / ".env")
 
@@ -62,6 +66,8 @@ logger = logging.getLogger("whereismymoney")
 Category = Literal["Food", "Transport", "Subscriptions", "Shopping", "Bills", "Other"]
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".mpeg", ".mp4", ".flac"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".bmp"}
+PARSE_LIMIT_SAVE_CONFIDENCE = 0.6
 
 
 def cents_to_speech(cents: int) -> str:
@@ -290,6 +296,10 @@ class TriggerCallBody(BaseModel):
     category: Category | None = None
 
 
+class ParseLimitBody(BaseModel):
+    text: str = Field(..., min_length=1)
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"ok": False, "error": "Validation error", "detail": exc.errors()})
@@ -352,9 +362,9 @@ def serve_call_audio(token: str) -> FileResponse:
     )
 
 
-async def _read_upload(file: UploadFile | None) -> tuple[bytes, str]:
+async def _read_upload(file: UploadFile | None) -> tuple[bytes, str, str]:
     if file is None:
-        return b"", ""
+        return b"", "", ""
     try:
         data = await file.read()
     except Exception as exc:
@@ -362,7 +372,26 @@ async def _read_upload(file: UploadFile | None) -> tuple[bytes, str]:
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Upload exceeds 20 MB")
     filename = file.filename or ""
-    return data, filename
+    content_type = file.content_type or ""
+    return data, filename, content_type
+
+
+def _looks_like_image(filename: str, data: bytes, content_type: str = "") -> bool:
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if suffix in IMAGE_SUFFIXES:
+        return True
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype.startswith("image/"):
+        return True
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return True
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return True
+    return False
 
 
 def _decode_text_bytes(data: bytes) -> str | None:
@@ -403,13 +432,35 @@ def _original_text(*, source: str, text: str | None, upload: bytes, filename: st
     if decoded:
         return decoded, "receipt-text"
 
-    # Receipt images have no OCR until Person C. Stub keeps /log-expense usable.
+    # Non-image receipt uploads: stub text keeps the demo usable without a photo.
+    # Image files never reach here — they go through categorize_receipt instead.
     if whisper_stub_enabled() or not upload:
         return "RECEIPT TOTAL 14.00 LUNCH", "stub"
     raise HTTPException(
         status_code=400,
-        detail="Could not extract text from receipt. Send a text file, a `text` form field, or wait for Person C OCR/Nemotron.",
+        detail="Could not extract text from receipt. Send an image file, a text file, or a `text` form field.",
     )
+
+
+def _expense_payload(parsed, source: str, text_engine: str, swap: str) -> dict[str, Any]:
+    expense = insert_expense(
+        original_text=parsed.original_text,
+        source=source,
+        merchant=parsed.merchant,
+        amount_cents=int(parsed.amount_cents),
+        category=parsed.category,
+        confidence=parsed.confidence,
+        needs_review=parsed.needs_review,
+    )
+    return {
+        "expense": expense,
+        "limitCheck": _maybe_over_limit_call(parsed.category),
+        "parse": {
+            "engine": parsed.engine,
+            "textEngine": text_engine,
+            "swap": swap,
+        },
+    }
 
 
 @app.post("/log-expense")
@@ -419,29 +470,39 @@ async def log_expense(
     text: str | None = Form(None),
 ) -> dict[str, Any]:
     """Voice or receipt → persist expense → run the weekly limit check."""
-    upload, filename = await _read_upload(file)
+    upload, filename, content_type = await _read_upload(file)
     try:
+        if source == "receipt" and upload and _looks_like_image(filename, upload, content_type):
+            suffix = Path(filename).suffix.lower() if filename else ""
+            if suffix not in IMAGE_SUFFIXES:
+                suffix = ".jpg"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(upload)
+                tmp_path = tmp.name
+            try:
+                label = Path(filename).name if filename else f"receipt{suffix}"
+                parsed = parse_receipt_image(
+                    tmp_path,
+                    original_text=f"[receipt photo: {label}]",
+                )
+            finally:
+                with suppress(OSError):
+                    os.unlink(tmp_path)
+            return _expense_payload(
+                parsed,
+                source,
+                "receipt",
+                "ai.receipt.categorize_receipt (nvidia/nemotron-3-nano-omni vision).",
+            )
+
         original, engine = _original_text(source=source, text=text, upload=upload, filename=filename)
         parsed = parse_expense(original)
-        expense = insert_expense(
-            original_text=parsed.original_text,
-            source=source,
-            merchant=parsed.merchant,
-            amount_cents=int(parsed.amount_cents),
-            category=parsed.category,
-            confidence=parsed.confidence,
-            needs_review=parsed.needs_review,
+        return _expense_payload(
+            parsed,
+            source,
+            engine,
+            "ai.categorize.categorize_expense when NVIDIA_API_KEY is set; heuristic fallback otherwise.",
         )
-        limit_check = _maybe_over_limit_call(parsed.category)
-        return {
-            "expense": expense,
-            "limitCheck": limit_check,
-            "parse": {
-                "engine": parsed.engine,
-                "textEngine": engine,
-                "swap": "ai.categorize.categorize_expense when NVIDIA_API_KEY is set; heuristic fallback otherwise.",
-            },
-        }
     except UnknownAmountError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HTTPException:
@@ -449,6 +510,71 @@ async def log_expense(
     except Exception as exc:
         logger.exception("log-expense failed")
         raise HTTPException(status_code=500, detail=f"Could not log expense: {exc}") from exc
+
+
+@app.post("/parse-limit")
+def parse_limit(body: ParseLimitBody) -> dict[str, Any]:
+    """Parse spoken limit text. Does not save. High-confidence results can POST /limits."""
+    from ai.spoken_limit import understand_spoken_limit
+
+    try:
+        parsed = understand_spoken_limit(body.text)
+    except Exception:
+        logger.exception("spoken limit parse failed")
+        parsed = {
+            "category": None,
+            "amount_cents": None,
+            "period": "weekly",
+            "confidence": 0.0,
+        }
+
+    if not isinstance(parsed, dict):
+        parsed = {
+            "category": None,
+            "amount_cents": None,
+            "period": "weekly",
+            "confidence": 0.0,
+        }
+
+    category = parsed.get("category")
+    if category not in CATEGORIES:
+        category = None
+
+    amount_cents = parsed.get("amount_cents")
+    if isinstance(amount_cents, bool) or amount_cents is None:
+        amount_cents = None
+    elif isinstance(amount_cents, int):
+        amount_cents = amount_cents if amount_cents >= 0 else None
+    elif isinstance(amount_cents, float) and abs(amount_cents - round(amount_cents)) <= 1e-6:
+        coerced = int(round(amount_cents))
+        amount_cents = coerced if coerced >= 0 else None
+    else:
+        amount_cents = None
+
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence != confidence:
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    ready = (
+        category is not None
+        and amount_cents is not None
+        and confidence >= PARSE_LIMIT_SAVE_CONFIDENCE
+    )
+    return {
+        "category": category,
+        "amount_cents": amount_cents,
+        "period": "weekly",
+        "confidence": confidence,
+        "readyToSave": ready,
+        "saveHint": (
+            "POST /limits with {category, limitCents: amount_cents} when readyToSave is true. "
+            "This endpoint does not persist."
+        ),
+    }
 
 
 @app.post("/limits")

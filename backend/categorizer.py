@@ -24,10 +24,12 @@ Category = str
 # ---------------------------------------------------------------------------
 # SWAP INTERFACE (Person C / NVIDIA Nemotron)
 # ---------------------------------------------------------------------------
-# ``parse_expense(text) -> ParsedExpense`` is the only parse entry point.
+# ``parse_expense(text) -> ParsedExpense`` is the text parse entry point.
 # When NVIDIA_API_KEY is set, the body calls ai.categorize.categorize_expense
 # and maps the dict onto ParsedExpense. On missing key / Nemotron failure it
 # uses the heuristic below so the demo still works offline.
+# Receipt **images** use ``parse_receipt_image`` → ai.receipt.categorize_receipt
+# and never invent cents via the heuristic.
 #
 # Required fields on ParsedExpense:
 #   original_text  str        unmodified input; persist forever (CONTRACT)
@@ -326,11 +328,12 @@ def _coerce_cents(value) -> int | None:
     return None
 
 
-def _from_nemotron_dict(original: str, data: dict) -> ParsedExpense:
+def _from_nemotron_dict(original: str, data: dict, *, engine: str = "nemotron") -> ParsedExpense:
     amount_cents = _coerce_cents(data.get("amount_cents"))
     if amount_cents is None:
+        kind = "receipt" if engine == "nemotron-vision" else "text"
         raise UnknownAmountError(
-            "Could not determine an amount in cents from the text. "
+            f"Could not determine an amount in cents from the {kind}. "
             "Please include a dollar amount and try again."
         )
 
@@ -359,8 +362,44 @@ def _from_nemotron_dict(original: str, data: dict) -> ParsedExpense:
         category=category,
         confidence=confidence,
         needs_review=needs_review,
-        engine="nemotron",
+        engine=engine,
     )
+
+
+def parse_receipt_image(image_path: str, *, original_text: str | None = None) -> ParsedExpense:
+    """Map Person C's vision dict onto ParsedExpense.
+
+    Images never fall back to the text heuristic — a null ``amount_cents``
+    becomes ``UnknownAmountError`` (HTTP 400) so we do not invent cents.
+    """
+    try:
+        from ai.receipt import categorize_receipt
+    except Exception as exc:
+        raise UnknownAmountError(
+            "Could not determine an amount in cents from the receipt. "
+            "Please include a dollar amount and try again."
+        ) from exc
+
+    try:
+        data = categorize_receipt(image_path)
+    except Exception as exc:
+        raise UnknownAmountError(
+            "Could not determine an amount in cents from the receipt. "
+            "Please include a dollar amount and try again."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise UnknownAmountError(
+            "Could not determine an amount in cents from the receipt. "
+            "Please include a dollar amount and try again."
+        )
+
+    label = Path(image_path).name if image_path else "receipt"
+    original = original_text if original_text is not None else data.get("original_text")
+    if not original:
+        original = f"[receipt photo: {label}]"
+
+    return _from_nemotron_dict(str(original), data, engine="nemotron-vision")
 
 
 def _try_nemotron_parse(original: str) -> ParsedExpense | None:
