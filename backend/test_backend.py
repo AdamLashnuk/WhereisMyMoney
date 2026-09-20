@@ -441,6 +441,7 @@ def test_elevenlabs_transcription_uses_mocked_http(monkeypatch, tmp_path) -> Non
         captured["headers"] = kwargs.get("headers")
         captured["data"] = kwargs.get("data")
         captured["files"] = kwargs.get("files")
+        captured["timeout"] = kwargs.get("timeout")
         return httpx.Response(
             200,
             request=httpx.Request("POST", url),
@@ -454,6 +455,7 @@ def test_elevenlabs_transcription_uses_mocked_http(monkeypatch, tmp_path) -> Non
     assert captured["url"] == ELEVENLABS_STT_URL
     assert captured["headers"] == {"xi-api-key": "test-elevenlabs-key"}
     assert captured["data"] == {"model_id": "scribe_v2", "language_code": "eng"}
+    assert captured["timeout"] == 20.0
     files = captured["files"]
     assert isinstance(files, dict)
     assert files["file"][0] == "sample.mp3"
@@ -495,6 +497,33 @@ def test_elevenlabs_http_error_falls_back_to_stub(monkeypatch, tmp_path) -> None
         )
 
     monkeypatch.setattr("httpx.post", fake_post)
+    text, engine = transcribe_audio(audio, source="voice")
+    assert engine == "stub"
+    assert text == STUB_VOICE_TEXT
+
+
+def test_elevenlabs_error_does_not_cascade_to_openai(monkeypatch, tmp_path) -> None:
+    import httpx
+
+    monkeypatch.setenv("WHISPER_STUB", "0")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-elevenlabs-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+
+    audio = tmp_path / "sample.mp3"
+    audio.write_bytes(b"ID3fake-audio-bytes")
+
+    def fake_post(url, **kwargs):
+        return httpx.Response(
+            503,
+            request=httpx.Request("POST", url),
+            json={"detail": "busy"},
+        )
+
+    def fail_openai(*_args, **_kwargs):
+        raise AssertionError("OpenAI Whisper must not run when ElevenLabs is configured")
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("whisper_client._try_openai", fail_openai)
     text, engine = transcribe_audio(audio, source="voice")
     assert engine == "stub"
     assert text == STUB_VOICE_TEXT
@@ -762,6 +791,61 @@ def test_log_expense_receipt_image_uses_vision(monkeypatch) -> None:
         assert payload["expense"]["merchant"] == "Chipotle"
         assert payload["expense"]["originalText"] == "[receipt photo: lunch.jpg]"
         assert payload["expense"]["source"] == "receipt"
+
+
+def test_log_expense_berghotel_receipt_is_5450_food(monkeypatch) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    fixture = Path(__file__).resolve().parent.parent / "ai" / "tests" / "fixtures" / "berghotel_grosse_scheidegg.png"
+    image_bytes = fixture.read_bytes()
+
+    def fake_receipt(image_path: str) -> dict:
+        assert Path(image_path).is_file()
+        return {
+            "original_text": "Berghotel Grosse Scheidegg · CHF 54.50",
+            "merchant": "Berghotel Grosse Scheidegg",
+            "amount_cents": 5450,
+            "category": "Food",
+            "confidence": 0.93,
+            "needs_review": False,
+            "nemotron_failed": False,
+        }
+
+    monkeypatch.setattr("ai.receipt.categorize_receipt", fake_receipt)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={"source": "receipt"},
+            files={"file": ("berghotel.png", image_bytes, "image/png")},
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert payload["expense"]["amountCents"] == 5450
+        assert payload["expense"]["category"] == "Food"
+        assert "Scheidegg" in payload["expense"]["merchant"]
+        assert payload["expense"]["originalText"] == "Berghotel Grosse Scheidegg · CHF 54.50"
+
+
+def test_parse_receipt_image_coerces_chf_string_to_5450(monkeypatch, tmp_path) -> None:
+    image = tmp_path / "berghotel.jpg"
+    image.write_bytes(_FAKE_JPEG)
+
+    def fake_receipt(_image_path: str) -> dict:
+        return {
+            "original_text": "Berghotel Grosse Scheidegg · CHF 54.50",
+            "merchant": "Berghotel Grosse Scheidegg",
+            "amount_cents": "CHF 54.50",
+            "category": "Food",
+            "confidence": 0.9,
+            "needs_review": False,
+            "nemotron_failed": False,
+        }
+
+    monkeypatch.setattr("ai.receipt.categorize_receipt", fake_receipt)
+    parsed = parse_receipt_image(str(image))
+    assert parsed.amount_cents == 5450
+    assert parsed.category == "Food"
+    assert "Scheidegg" in (parsed.merchant or "")
 
 
 def test_log_expense_receipt_image_null_amount_is_400(monkeypatch) -> None:

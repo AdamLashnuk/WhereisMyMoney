@@ -301,30 +301,17 @@ def _nemotron_available() -> bool:
 
 
 def _coerce_cents(value) -> int | None:
-    """Integer cents only. Refuse floats that aren't whole numbers."""
+    """Integer cents only. Dollar strings like ``"$14"`` / ``"14.00"`` become cents."""
+    try:
+        from ai.receipt import coerce_amount_cents
+    except Exception:
+        coerce_amount_cents = None
+    if coerce_amount_cents is not None:
+        return coerce_amount_cents(value)
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        cents = int(round(value))
-        if abs(value - cents) > 1e-6:
-            return None
-        return cents
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        try:
-            if any(ch in stripped for ch in ".eE"):
-                number = float(stripped)
-                cents = int(round(number))
-                if abs(number - cents) > 1e-6:
-                    return None
-                return cents
-            return int(stripped)
-        except ValueError:
-            return None
+        return value if value >= 0 else None
     return None
 
 

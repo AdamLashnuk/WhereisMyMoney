@@ -1,4 +1,5 @@
 from ai.nemotron import ask_nemotron_json
+from ai.receipt import coerce_amount_cents
 
 SYSTEM_PROMPT = """You are an expense categorizer for a budgeting app. You read messy, \
 spoken-style text describing a purchase and return structured data. You never talk to \
@@ -42,7 +43,7 @@ def categorize_expense(raw_text):
     )
 
     if result is None:
-        # Nemotron failed twice — never crash the server, flag it instead.
+        # Nemotron failed — never crash the server, flag it instead.
         # nemotron_failed lets the backend fall back to the heuristic parser
         # instead of treating this as a successful "I don't know the amount".
         return {
@@ -61,12 +62,13 @@ def categorize_expense(raw_text):
     if category not in valid_categories:
         category = "Other"
 
+    amount_cents = coerce_amount_cents(result.get("amount_cents"))
     return {
         "original_text": raw_text,
         "merchant": result.get("merchant"),
-        "amount_cents": result.get("amount_cents"),
+        "amount_cents": amount_cents,
         "category": category,
         "confidence": result.get("confidence", 0.0),
-        "needs_review": result.get("needs_review", True),
+        "needs_review": result.get("needs_review", True) if amount_cents is not None else True,
         "nemotron_failed": False,
     }

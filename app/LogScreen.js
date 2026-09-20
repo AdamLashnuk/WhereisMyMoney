@@ -7,6 +7,27 @@ import { getHealth, logReceiptPhoto, logReceiptText, logTextExpense, logVoiceExp
 const P = { bg: '#EFF4F8', white: '#FFFFFF', ink: '#192D42', black: '#111923', muted: '#647687', line: '#DCE5EB', coral: '#FF855B', yellow: '#FFF36A', peach: '#FFF0DE', red: '#AA3030', green: '#287C54' };
 const font = { display: Platform.OS === 'ios' ? 'Georgia-Bold' : 'serif', body: Platform.OS === 'ios' ? 'AvenirNext-Regular' : 'sans-serif', bold: Platform.OS === 'ios' ? 'AvenirNext-Bold' : 'sans-serif-medium' };
 const money = value => `$${((Number(value) || 0) / 100).toFixed(2)}`;
+const RECEIPT_IMAGE_OPTIONS = {
+  mediaTypes: ['images'],
+  quality: 0.6,
+  allowsEditing: false,
+  exif: false,
+  preferredAssetRepresentationMode: 'compatible',
+};
+const HIGH_VOICE = RecordingPresets.HIGH_QUALITY;
+const VOICE_RECORDING_PRESET = {
+  ...HIGH_VOICE,
+  sampleRate: 16000,
+  numberOfChannels: 1,
+  bitRate: 48000,
+  android: HIGH_VOICE.android
+    ? { ...HIGH_VOICE.android, sampleRate: 16000, numberOfChannels: 1, bitRate: 48000 }
+    : HIGH_VOICE.android,
+  ios: HIGH_VOICE.ios
+    ? { ...HIGH_VOICE.ios, sampleRate: 16000, numberOfChannels: 1, bitRate: 48000 }
+    : HIGH_VOICE.ios,
+  web: HIGH_VOICE.web ? { ...HIGH_VOICE.web, bitsPerSecond: 48000 } : HIGH_VOICE.web,
+};
 
 function MainButton({ title, onPress, disabled, light }) {
   return <TouchableOpacity accessibilityRole="button" disabled={disabled} onPress={onPress} style={[styles.mainButton, light && styles.lightButton, disabled && styles.disabled]}><Text style={[styles.mainButtonText, light && styles.lightButtonText]}>{title}</Text><Text style={[styles.arrow, light && styles.lightButtonText]}>→</Text></TouchableOpacity>;
@@ -22,7 +43,7 @@ export default function LogScreen({ onLogged }) {
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const recorder = useAudioRecorder(VOICE_RECORDING_PRESET);
   const recorderState = useAudioRecorderState(recorder);
 
   useEffect(() => {
@@ -61,7 +82,7 @@ export default function LogScreen({ onLogged }) {
     try {
       const permission = await ImagePicker.requestCameraPermissionsAsync();
       if (!permission.granted) throw new Error('Camera access is required. Allow it in iPhone Settings and try again.');
-      const picture = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.75, allowsEditing: false });
+      const picture = await ImagePicker.launchCameraAsync(RECEIPT_IMAGE_OPTIONS);
       if (!picture.canceled && picture.assets?.[0]?.uri) { setPhoto(picture.assets[0]); setReceiptText(''); }
     } catch (err) { setError(err.message || 'Could not open the camera.'); }
   }
@@ -70,7 +91,7 @@ export default function LogScreen({ onLogged }) {
     if (busy || recording) return;
     setError('');
     try {
-      const picture = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.75, allowsEditing: false });
+      const picture = await ImagePicker.launchImageLibraryAsync(RECEIPT_IMAGE_OPTIONS);
       if (!picture.canceled && picture.assets?.[0]?.uri) { setPhoto(picture.assets[0]); setReceiptText(''); }
     } catch (err) { setError(err.message || 'Could not select a photo.'); }
   }
