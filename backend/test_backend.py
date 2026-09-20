@@ -39,6 +39,11 @@ from twilio_client import (  # noqa: E402
     place_call,
     twimlets_say_url,
 )
+from weekly_summary import (  # noqa: E402
+    WEEKLY_SUMMARY_MAX_ITEMS,
+    expenses_spent_sentence,
+    merchant_for_speech,
+)
 from whisper_client import (  # noqa: E402
     ELEVENLABS_STT_URL,
     STUB_VOICE_TEXT,
@@ -700,10 +705,14 @@ def test_place_call_plays_elevenlabs_audio_via_twiml_url(monkeypatch, tmp_path) 
         assert f"https://demo.ngrok-free.app/call-audio/{token}.ulaw" in body
         assert ".mp3" not in body
         assert "<Say>" not in body
+        assert "<Gather" not in body
+        assert "<Hangup/>" in body
 
         posted = client.post(f"/twiml/play/{token}")
         assert posted.status_code == 200
         assert f"/call-audio/{token}.ulaw" in posted.text
+        assert "<Hangup/>" in posted.text
+        assert "<Gather" not in posted.text
 
         ulaw = client.get(f"/call-audio/{token}.ulaw")
         assert ulaw.status_code == 200
@@ -1113,3 +1122,143 @@ def test_parse_limit_rejects_empty_text() -> None:
         saved = client.post("/limits", json={"category": "Transport", "limitCents": 2500})
         assert saved.status_code == 200
         assert saved.json()["limits"]["Transport"] == 2500
+
+
+def test_merchant_for_speech_cleans_names() -> None:
+    assert merchant_for_speech("celcius") == "Celcius"
+    assert merchant_for_speech("walmart") == "Walmart"
+    assert merchant_for_speech("aws credits") == "AWS Credits"
+    assert merchant_for_speech(None, category="Food") == "Food"
+    assert merchant_for_speech("", category="Other") == "other spending"
+
+
+def test_weekly_summary_lists_sample_expenses_in_spoken_usd() -> None:
+    expenses = [
+        {"merchant": "celcius", "amountCents": 100, "category": "Food"},
+        {"merchant": "walmart", "amountCents": 1300, "category": "Shopping"},
+        {"merchant": "aws credits", "amountCents": 50000, "category": "Other"},
+    ]
+    sentence = expenses_spent_sentence(expenses)
+    assert sentence == (
+        "Spent one dollar on Celcius, thirteen dollars on Walmart, "
+        "and five hundred dollars on AWS Credits."
+    )
+    assert "$" not in sentence
+    assert "CHF" not in sentence
+    assert "100" not in sentence
+    assert "50000" not in sentence
+
+    totals = {
+        "Food": 100,
+        "Transport": 0,
+        "Subscriptions": 0,
+        "Shopping": 1300,
+        "Bills": 0,
+        "Other": 50000,
+    }
+    spoken = weekly_summary_speech(totals, 51400, expenses=expenses)
+    assert spoken == (
+        "Spent one dollar on Celcius, thirteen dollars on Walmart, "
+        "and five hundred dollars on AWS Credits."
+    )
+    assert "Where Is My Money" not in spoken
+    assert "$" not in spoken
+    assert "CHF" not in spoken
+
+
+def test_weekly_summary_two_items_and_singular_cent() -> None:
+    sentence = expenses_spent_sentence(
+        [
+            {"merchant": "bus", "amountCents": 1, "category": "Transport"},
+            {"merchant": "cafe", "amountCents": 200, "category": "Food"},
+        ]
+    )
+    assert sentence == "Spent one cent on Bus and two dollars on Cafe."
+    assert "cents" not in sentence
+
+
+def test_weekly_summary_caps_long_lists_with_and_more() -> None:
+    expenses = [
+        {"merchant": f"shop {i}", "amountCents": (i + 1) * 100, "category": "Shopping"}
+        for i in range(WEEKLY_SUMMARY_MAX_ITEMS + 3)
+    ]
+    sentence = expenses_spent_sentence(expenses)
+    assert WEEKLY_SUMMARY_MAX_ITEMS == 6
+    assert sentence.count(" on ") == WEEKLY_SUMMARY_MAX_ITEMS
+    assert "and three more" in sentence
+    assert "Shop 8" in sentence  # largest amount when truncated
+    assert "Shop 0" not in sentence
+    assert "$" not in sentence
+
+
+def test_trigger_weekly_summary_message_lists_ledger_expenses(monkeypatch, tmp_path) -> None:
+    _twilio_env(
+        monkeypatch,
+        tmp_path,
+        PUBLIC_BASE_URL="https://demo.ngrok-free.app",
+        MY_PHONE_NUMBER="+15555550100",
+    )
+    captured = _install_fake_twilio(monkeypatch)
+    spoken: list[str] = []
+
+    def fake_success(sentence, output_path):
+        spoken.append(sentence)
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x00\x01ulaw")
+        return {"success": True, "audio_path": output_path}
+
+    monkeypatch.setattr("twilio_client.get_call_audio", fake_success)
+    _fresh_db()
+    insert_expense(
+        original_text="celcius",
+        source="voice",
+        merchant="celcius",
+        amount_cents=100,
+        category="Food",
+        confidence=0.9,
+        needs_review=False,
+    )
+    insert_expense(
+        original_text="walmart",
+        source="receipt",
+        merchant="walmart",
+        amount_cents=1300,
+        category="Shopping",
+        confidence=0.9,
+        needs_review=False,
+    )
+    insert_expense(
+        original_text="aws credits",
+        source="voice",
+        merchant="aws credits",
+        amount_cents=50000,
+        category="Other",
+        confidence=0.9,
+        needs_review=False,
+    )
+    with TestClient(app) as client:
+        posted = client.post("/trigger-call", json={"kind": "weekly_summary"})
+        assert posted.status_code == 200
+        body = posted.json()
+        assert body["kind"] == "weekly_summary"
+        message = body["message"]
+        assert "one dollar" in message
+        assert "Celcius" in message
+        assert "thirteen dollars" in message
+        assert "Walmart" in message
+        assert "five hundred dollars" in message
+        assert "AWS" in message
+        assert "$" not in message
+        assert "CHF" not in message
+        assert "50000" not in message
+        assert spoken
+        assert "one dollar" in spoken[0]
+        assert "$" not in spoken[0]
+        url = str(captured.get("url") or "")
+        twiml = client.get(url.replace("https://demo.ngrok-free.app", ""))
+        assert twiml.status_code == 200
+        assert "<Play>" in twiml.text
+        assert "<Hangup/>" in twiml.text
+        assert "<Gather" not in twiml.text
+

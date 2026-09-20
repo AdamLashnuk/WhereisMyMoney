@@ -53,6 +53,7 @@ from twilio_client import (
     render_play_twiml,
     twilio_configured,
 )
+from weekly_summary import expenses_spent_sentence
 from whisper_client import transcribe_audio, whisper_stub_enabled
 
 _BACKEND_DIR = Path(__file__).resolve().parent
@@ -71,7 +72,6 @@ Category = Literal["Food", "Transport", "Subscriptions", "Shopping", "Bills", "O
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".mpeg", ".mp4", ".flac", ".caf"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".bmp"}
-PARSE_LIMIT_SAVE_CONFIDENCE = 0.6
 _E164ISH = re.compile(r"^\+[1-9]\d{7,14}$")
 _CONTENT_TYPE_AUDIO_SUFFIX = {
     "audio/mp4": ".m4a",
@@ -157,25 +157,23 @@ def weekly_summary_speech(
     totals: dict[str, int],
     week_total: int,
     last_week_totals: dict[str, int] | None = None,
+    expenses: list[dict[str, Any]] | None = None,
 ) -> str:
-    # Phone audio degrades on long scripts — speak a short intro + the top
-    # category only. Person C's weekly_pattern_sentence is appended, then
-    # currency symbols/codes are normalized to spoken USD.
-    if week_total == 0:
-        parts = [
-            "This is Where Is My Money with your weekly summary.",
-            "No expenses logged this week.",
-        ]
+    """Spoken weekly call script. Lists this week's expenses when provided."""
+    spent_list = expenses_spent_sentence(expenses)
+    if spent_list:
+        base = rewrite_money_for_speech(spent_list)
+    elif week_total == 0:
+        base = "No expenses logged this week."
     else:
-        parts = [
-            "This is Where Is My Money with your weekly summary.",
-            f"You spent {cents_to_speech(week_total)} this week.",
-        ]
+        parts = [f"You spent {cents_to_speech(week_total)} this week."]
         top_category = max(CATEGORIES, key=lambda category: totals.get(category, 0))
         if totals.get(top_category, 0):
             parts.append(f"Mostly on {top_category}.")
-    base = " ".join(parts)
-    if not _nemotron_configured():
+        base = " ".join(parts)
+
+    # Expense list is the demo script. Skip Nemotron so the call stays short.
+    if spent_list or not _nemotron_configured():
         return base
     try:
         from ai.weekly_pattern import weekly_pattern_sentence
@@ -239,7 +237,8 @@ def place_weekly_summary_call(*, force: bool = False, phone_number: str | None =
     totals = week_totals(week_start=week_start)
     week_total = sum(totals.values())
     last_week_totals = week_totals(week_start=week_start - timedelta(days=7))
-    spoken = weekly_summary_speech(totals, week_total, last_week_totals)
+    expenses = list_expenses(week_start=week_start)
+    spoken = weekly_summary_speech(totals, week_total, last_week_totals, expenses=expenses)
 
     if not force and has_successful_call("weekly_summary", None, week_start):
         return {
@@ -402,7 +401,7 @@ def _play_twiml_response(token: str, request: Request) -> Response:
 
 @app.api_route("/twiml/play/{token}", methods=["GET", "POST"])
 def twiml_play(token: str, request: Request) -> Response:
-    """First-party TwiML for Twilio: <Play> the cached ElevenLabs μ-law audio."""
+    """First-party TwiML for Twilio: <Play> the alert, then hang up."""
     return _play_twiml_response(token, request)
 
 
@@ -616,13 +615,15 @@ async def log_expense(
         raise HTTPException(status_code=500, detail=f"Could not log expense: {exc}") from exc
 
 
-@app.post("/parse-limit")
-def parse_limit(body: ParseLimitBody) -> dict[str, Any]:
-    """Parse spoken limit text. Does not save. High-confidence results can POST /limits."""
+PARSE_LIMIT_SAVE_CONFIDENCE = 0.6
+
+
+def parse_limit_text(text: str) -> dict[str, Any]:
+    """Same result as ``POST /parse-limit``. Does not persist."""
     from ai.spoken_limit import understand_spoken_limit
 
     try:
-        parsed = understand_spoken_limit(body.text)
+        parsed = understand_spoken_limit(text)
     except Exception:
         logger.exception("spoken limit parse failed")
         parsed = {
@@ -679,6 +680,12 @@ def parse_limit(body: ParseLimitBody) -> dict[str, Any]:
             "This endpoint does not persist."
         ),
     }
+
+
+@app.post("/parse-limit")
+def parse_limit(body: ParseLimitBody) -> dict[str, Any]:
+    """Parse spoken limit text. Does not save. High-confidence results can POST /limits."""
+    return parse_limit_text(body.text)
 
 
 @app.post("/limits")
