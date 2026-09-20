@@ -1,6 +1,6 @@
 # Where Is My Money — Phone app
 
-Expo SDK 57 frontend starter. This is a UI preview: three tabs are navigable; History uses clearly labeled sample data; recording, camera uploads, limit saving, and backend requests are not implemented yet.
+Expo SDK 57 frontend. Log (receipt photo / voice / text), History, Limits, and Settings talk to Person B’s backend via `config.js`. Developer tools can place a one-time summary call to the number you type (`triggerWeeklyCall(phoneNumber)`). Receipt photos upload even if `/health` has not advertised OCR yet. Voice recordings upload as `audio/mp4` m4a.
 
 ## Run it on your iPhone
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import tempfile
 from contextlib import asynccontextmanager, suppress
@@ -65,9 +66,26 @@ logger = logging.getLogger("whereismymoney")
 
 Category = Literal["Food", "Transport", "Subscriptions", "Shopping", "Bills", "Other"]
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".mpeg", ".mp4", ".flac"}
+AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".mpeg", ".mp4", ".flac", ".caf"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".bmp"}
 PARSE_LIMIT_SAVE_CONFIDENCE = 0.6
+_E164ISH = re.compile(r"^\+[1-9]\d{7,14}$")
+_CONTENT_TYPE_AUDIO_SUFFIX = {
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/webm": ".webm",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "audio/x-caf": ".caf",
+    "video/mp4": ".m4a",
+}
 
 
 def cents_to_speech(cents: int) -> str:
@@ -81,6 +99,43 @@ def cents_to_speech(cents: int) -> str:
 def _nemotron_configured() -> bool:
     key = os.getenv("NVIDIA_API_KEY")
     return bool(key and str(key).strip())
+
+
+def _elevenlabs_configured() -> bool:
+    return bool(os.getenv("ELEVENLABS_API_KEY", "").strip())
+
+
+def _voice_stt_available() -> bool:
+    """Live STT is advertised only when the stub is off and a key is present."""
+    if whisper_stub_enabled():
+        return False
+    return _elevenlabs_configured() or bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+
+def _normalize_trigger_phone(override: str | None) -> str | None:
+    """Validate an optional E.164-ish override. None/blank → use saved settings."""
+    if override is None:
+        return None
+    cleaned = str(override).strip()
+    if not cleaned:
+        return None
+    if _E164ISH.fullmatch(cleaned):
+        return cleaned
+    digits = re.sub(r"\D", "", cleaned)
+    if len(digits) >= 8:
+        return cleaned
+    raise HTTPException(
+        status_code=400,
+        detail="phoneNumber must be E.164 (e.g. +14155550123) or at least 8 digits",
+    )
+
+
+def _call_destination(override: str | None) -> str | None:
+    """Dial override if provided, else saved settings (place_call falls back to MY_PHONE_NUMBER)."""
+    validated = _normalize_trigger_phone(override)
+    if validated:
+        return validated
+    return get_settings().get("phoneNumber")
 
 
 def over_limit_speech(category: str, week_total: int, limit: int, over_by: int) -> str:
@@ -183,7 +238,7 @@ def _maybe_over_limit_call(category: str) -> dict[str, Any]:
     return result
 
 
-def place_weekly_summary_call(*, force: bool = False) -> dict[str, Any]:
+def place_weekly_summary_call(*, force: bool = False, phone_number: str | None = None) -> dict[str, Any]:
     week_start = sunday_week_start()
     totals = week_totals(week_start=week_start)
     week_total = sum(totals.values())
@@ -201,8 +256,8 @@ def place_weekly_summary_call(*, force: bool = False) -> dict[str, Any]:
             "message": spoken,
         }
 
-    settings = get_settings()
-    call = place_call(settings.get("phoneNumber"), spoken)
+    dest = _call_destination(phone_number)
+    call = place_call(dest, spoken)
     logged = log_call(
         kind="weekly_summary",
         category=None,
@@ -294,6 +349,7 @@ class SettingsBody(BaseModel):
 class TriggerCallBody(BaseModel):
     kind: Literal["over_limit", "weekly_summary"] = "weekly_summary"
     category: Category | None = None
+    phoneNumber: str | None = None
 
 
 class ParseLimitBody(BaseModel):
@@ -318,13 +374,20 @@ async def unhandled_handler(_request: Request, exc: Exception) -> JSONResponse:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    nemotron = _nemotron_configured()
     return {
         "status": "ok",
         "mode": "live",
         "userId": USER_ID,
         "whisperStub": whisper_stub_enabled(),
         "twilioConfigured": twilio_configured(),
-        "nemotronConfigured": _nemotron_configured(),
+        "nemotronConfigured": nemotron,
+        "receiptOcrEnabled": nemotron,
+        "capabilities": {
+            "receiptOCR": nemotron,
+            "voiceStt": _voice_stt_available(),
+            "nemotron": nemotron,
+        },
     }
 
 
@@ -409,24 +472,49 @@ def _decode_text_bytes(data: bytes) -> str | None:
     return None
 
 
-def _original_text(*, source: str, text: str | None, upload: bytes, filename: str) -> tuple[str, str]:
+def _audio_suffix(filename: str, content_type: str = "") -> str:
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if suffix in AUDIO_SUFFIXES:
+        return suffix
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    return _CONTENT_TYPE_AUDIO_SUFFIX.get(ctype, ".m4a")
+
+
+def _transcribe_upload(upload: bytes, filename: str, content_type: str = "") -> tuple[str, str]:
+    suffix = _audio_suffix(filename, content_type)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(upload)
+        tmp_path = tmp.name
+    try:
+        return transcribe_audio(
+            tmp_path,
+            source="voice",
+            content_type=content_type,
+            filename=filename,
+        )
+    finally:
+        with suppress(OSError):
+            os.unlink(tmp_path)
+
+
+def _original_text(
+    *,
+    source: str,
+    text: str | None,
+    upload: bytes,
+    filename: str,
+    content_type: str = "",
+) -> tuple[str, str]:
     """Return (original_text, text_engine)."""
+    # Voice audio bytes always go through STT — do not prefer a leftover form field.
+    if source == "voice" and upload:
+        return _transcribe_upload(upload, filename, content_type)
+
     if text and text.strip():
         return text.strip(), "form"
 
     if source == "voice":
-        suffix = Path(filename).suffix.lower() if filename else ".wav"
-        if suffix not in AUDIO_SUFFIXES:
-            suffix = ".wav"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(upload)
-            tmp_path = tmp.name
-        try:
-            spoken, engine = transcribe_audio(tmp_path, source="voice")
-            return spoken, engine
-        finally:
-            with suppress(OSError):
-                os.unlink(tmp_path)
+        return _transcribe_upload(upload, filename, content_type)
 
     decoded = _decode_text_bytes(upload)
     if decoded:
@@ -495,7 +583,13 @@ async def log_expense(
                 "ai.receipt.categorize_receipt (nvidia/nemotron-3-nano-omni vision).",
             )
 
-        original, engine = _original_text(source=source, text=text, upload=upload, filename=filename)
+        original, engine = _original_text(
+            source=source,
+            text=text,
+            upload=upload,
+            filename=filename,
+            content_type=content_type,
+        )
         parsed = parse_expense(original)
         return _expense_payload(
             parsed,
@@ -630,8 +724,8 @@ def trigger_call(body: TriggerCallBody) -> dict[str, Any]:
         total = week_total_for_category(body.category, week_start=week_start)
         over_by = max(0, total - limit)
         spoken = over_limit_speech(body.category, total, limit, over_by)
-        settings = get_settings()
-        call = place_call(settings.get("phoneNumber"), spoken)
+        dest = _call_destination(body.phoneNumber)
+        call = place_call(dest, spoken)
         logged = log_call(
             kind="over_limit",
             category=body.category,
@@ -652,7 +746,7 @@ def trigger_call(body: TriggerCallBody) -> dict[str, Any]:
             "error": call.get("error"),
         }
 
-    result = place_weekly_summary_call(force=True)
+    result = place_weekly_summary_call(force=True, phone_number=body.phoneNumber)
     return {
         "ok": bool(result.get("ok")),
         "kind": "weekly_summary",

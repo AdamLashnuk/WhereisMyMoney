@@ -178,14 +178,11 @@ function SettingsScreen() {
   const placeTestCall = async () => {
     setBusy(true); setCallMessage('');
     try {
-      if (!savedSettings) throw new Error('Load and save call settings first.');
       const number = testNumber.trim();
       if (!validPhone(number)) throw new Error('Enter a phone number with country code, e.g. +14155550123.');
-      // The existing backend only dials the saved number. Do not silently edit it.
-      if (number !== savedSettings.phoneNumber) throw new Error('This backend can only dial the saved phone number. Save this number in regular Settings first, then try again. Ask Sebastian to support a one-time phoneNumber override.');
-      const data = await triggerWeeklyCall();
+      const data = await triggerWeeklyCall(number);
       if (!data.ok) throw new Error(data.error || data.call?.error || 'The server could not place the call. Check Twilio and number verification.');
-      setCallMessage('The server accepted the summary call request to your saved number.');
+      setCallMessage(`The server accepted the summary call request to ${number}.`);
     } catch (err) { setCallMessage(err.message || 'Call failed.'); }
     finally { setBusy(false); }
   };
@@ -197,7 +194,7 @@ function SettingsScreen() {
     <View style={s.devCard}>
       <Text style={s.devLabel}>DESTINATION NUMBER</Text>
       <TextInput accessibilityLabel="Developer call destination" keyboardType="phone-pad" autoComplete="tel" placeholder="+14155550123" placeholderTextColor={C.devMuted} style={s.devInput} value={testNumber} onChangeText={setTestNumber}/>
-      <Text style={s.devHint}>The current backend dials the saved number only. To use a different number, save it on the regular Settings screen first.</Text>
+      <Text style={s.devHint}>Calls the number typed here without changing saved Settings. Trial Twilio accounts can dial only verified numbers.</Text>
       <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => Alert.alert('Place summary call?', `Call ${testNumber.trim() || 'the saved number'} now with your weekly spending summary? Carrier/Twilio charges may apply.`, [{ text: 'Cancel', style: 'cancel' }, { text: 'Call now', onPress: placeTestCall }])} style={[s.devButton, busy && s.disabled]}><Text style={s.devButtonText}>{busy ? 'Calling…' : 'Call spending summary'}</Text><Text style={s.devButtonText}>↗</Text></TouchableOpacity>
       <Message text={callMessage} positive={callMessage.startsWith('The server accepted')}/>
     </View>

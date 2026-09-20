@@ -122,13 +122,12 @@ export default function LogScreen({ onLogged }) {
       <MainButton title={photo ? 'Retake photo' : 'Open camera'} onPress={captureReceipt} disabled={busy} light/>
       <TouchableOpacity accessibilityRole="button" onPress={choosePhoto} disabled={busy} style={styles.secondaryLink}><Text style={styles.secondaryLinkText}>Or choose a photo from your library →</Text></TouchableOpacity>
       {photo ? <>
-        {ocrAvailable ? <><Text style={styles.hint}>Your server reports receipt scanning is available. Review the saved amount and category after scanning.</Text><MainButton title={busy ? 'Scanning…' : 'Scan and add expense'} disabled={busy} onPress={() => send(() => logReceiptPhoto(photo), () => { setPhoto(null); setReceiptText(''); })}/></> : <>
-          <View style={styles.info}><Text style={styles.infoText}>Photo captured. Automatic photo reading is not available on Sebastian’s server yet. Nothing has been added to spending.</Text></View>
-          <Text style={styles.fieldLabel}>TYPE THE TOTAL AND PURCHASE DETAILS</Text>
-          <TextInput accessibilityLabel="Receipt total and purchase details" editable={!busy} multiline placeholder="e.g. $14.00 for lunch at the cafe" placeholderTextColor={P.muted} style={[styles.input, styles.area]} value={receiptText} onChangeText={setReceiptText}/>
-          <Text style={styles.hint}>The backend will categorize the words you enter. Your photo is only a preview; it is not uploaded or stored in this mode.</Text>
-          <MainButton title={busy ? 'Saving…' : 'Categorize and add expense'} disabled={busy || !receiptText.trim()} onPress={() => send(() => logReceiptText(receiptText), () => { setReceiptText(''); setPhoto(null); })}/>
-        </>}
+        <Text style={styles.hint}>{ocrAvailable ? 'Your server reports receipt scanning is available. Review the saved amount and category after scanning.' : 'Scan this photo to send it to the backend. Review the saved amount and category after scanning.'}</Text>
+        <MainButton title={busy ? 'Scanning…' : 'Scan and add expense'} disabled={busy} onPress={() => send(() => logReceiptPhoto(photo), () => { setPhoto(null); setReceiptText(''); })}/>
+        <Text style={styles.fieldLabel}>OR TYPE THE TOTAL AND PURCHASE DETAILS</Text>
+        <TextInput accessibilityLabel="Receipt total and purchase details" editable={!busy} multiline placeholder="e.g. $14.00 for lunch at the cafe" placeholderTextColor={P.muted} style={[styles.input, styles.area]} value={receiptText} onChangeText={setReceiptText}/>
+        <Text style={styles.hint}>Optional: type the total if you prefer not to scan the photo.</Text>
+        <MainButton title={busy ? 'Saving…' : 'Categorize and add expense'} disabled={busy || !receiptText.trim()} onPress={() => send(() => logReceiptText(receiptText), () => { setReceiptText(''); setPhoto(null); })}/>
       </> : null}
     </View>}
 
