@@ -1,25 +1,27 @@
 import { API_BASE_URL } from './config';
-import { fetch as expoFetch } from 'expo/fetch';
-import { File } from 'expo-file-system';
+import { File, UploadType } from 'expo-file-system';
 
-async function parseResponse(response) {
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const details = data.error || data.detail;
-    throw new Error(typeof details === 'string' ? details : `Server error (${response.status})`);
+async function parseJsonBody(body) {
+  if (body == null || body === '') return {};
+  if (typeof body === 'object') return body;
+  try {
+    return JSON.parse(String(body));
+  } catch {
+    return {};
   }
-  return data;
 }
 
-async function request(path, options = {}) {
+async function requestJson(path, options = {}) {
   try {
-    const response = await expoFetch(`${API_BASE_URL}${path}`, options);
-    return await parseResponse(response);
+    const response = await fetch(`${API_BASE_URL}${path}`, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const details = data.error || data.detail;
+      throw new Error(typeof details === 'string' ? details : `Server error (${response.status})`);
+    }
+    return data;
   } catch (error) {
     const message = String(error?.message || error);
-    if (/Unsupported FormDataPart/i.test(message)) {
-      throw new Error('Upload failed (FormData). On Person A laptop: git pull feat/app && cd app && npm i && npx expo start -c');
-    }
     if (
       error instanceof TypeError
       || message === 'Network request failed'
@@ -32,39 +34,54 @@ async function request(path, options = {}) {
 }
 
 function postJSON(path, body) {
-  return request(path, {
+  return requestJson(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 }
 
-/** Build a FormData file part Expo fetch accepts (not RN {uri,name,type}). */
-async function appendLocalFile(form, field, uri, name, mime) {
+/**
+ * Native multipart upload — avoids Expo fetch FormDataPart errors entirely.
+ */
+async function uploadExpenseFile({ source, uri, parameters = {} }) {
   if (!uri) throw new Error('Missing local file URI.');
-  try {
-    form.append(field, new File(uri));
-    return;
-  } catch (_) {
-    // fall through
+  const file = new File(uri);
+  const task = file.createUploadTask(`${API_BASE_URL}/log-expense`, {
+    uploadType: UploadType.MULTIPART,
+    fieldName: 'file',
+    mimeType: guessMime(uri, source),
+    parameters: { source, ...parameters },
+  });
+  const result = await task.uploadAsync();
+  const status = result?.status ?? result?.statusCode ?? 0;
+  const data = await parseJsonBody(result?.body);
+  if (status < 200 || status >= 300) {
+    const details = data.error || data.detail;
+    throw new Error(typeof details === 'string' ? details : `Server error (${status})`);
   }
-  const response = await expoFetch(uri);
-  if (!response.ok) throw new Error('Could not read the local file for upload.');
-  const blob = await response.blob();
-  const type = mime || blob.type || 'application/octet-stream';
-  try {
-    form.append(field, new File([blob], name, { type }));
-  } catch (_) {
-    form.append(field, blob, name);
-  }
+  return data;
 }
 
-export const getExpenses = () => request('/expenses');
-export const getLimits = () => request('/limits');
+function guessMime(uri, source) {
+  const lower = String(uri).split('?')[0].toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.heic') || lower.endsWith('.heif')) return 'image/heic';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.wav')) return 'audio/wav';
+  if (lower.endsWith('.mp3')) return 'audio/mpeg';
+  if (lower.endsWith('.webm')) return 'audio/webm';
+  if (source === 'receipt') return 'image/jpeg';
+  return 'audio/mp4';
+}
+
+export const getExpenses = () => requestJson('/expenses');
+export const getLimits = () => requestJson('/limits');
 export const saveLimit = (category, limitCents) => postJSON('/limits', { category, limitCents });
-export const getSettings = () => request('/settings');
+export const getSettings = () => requestJson('/settings');
 export const saveSettings = (settings) => postJSON('/settings', settings);
-export const getHealth = () => request('/health');
+export const getHealth = () => requestJson('/health');
 
 export function triggerWeeklyCall(phoneNumber) {
   const body = { kind: 'weekly_summary' };
@@ -77,33 +94,12 @@ export function logTextExpense(text) {
   const form = new FormData();
   form.append('source', 'voice');
   form.append('text', text);
-  return request('/log-expense', { method: 'POST', body: form });
+  return requestJson('/log-expense', { method: 'POST', body: form });
 }
 
-function voiceFilename(uri) {
-  const last = String(uri).split('?')[0].split('/').pop() || '';
-  if (/\.(m4a|mp4|wav|mp3|aac|caf|webm|ogg)$/i.test(last)) return last;
-  return 'expense.m4a';
-}
-
-function voiceMime(name) {
-  const lower = String(name).toLowerCase();
-  if (lower.endsWith('.wav')) return 'audio/wav';
-  if (lower.endsWith('.mp3')) return 'audio/mpeg';
-  if (lower.endsWith('.webm')) return 'audio/webm';
-  if (lower.endsWith('.ogg')) return 'audio/ogg';
-  if (lower.endsWith('.aac')) return 'audio/aac';
-  if (lower.endsWith('.caf')) return 'audio/x-caf';
-  return 'audio/mp4';
-}
-
-export async function logVoiceExpense(uri) {
+export function logVoiceExpense(uri) {
   if (!uri) throw new Error('Recording was empty. Please try again.');
-  const name = voiceFilename(uri);
-  const form = new FormData();
-  form.append('source', 'voice');
-  await appendLocalFile(form, 'file', uri, name, voiceMime(name));
-  return request('/log-expense', { method: 'POST', body: form });
+  return uploadExpenseFile({ source: 'voice', uri });
 }
 
 export function logReceiptText(text) {
@@ -111,15 +107,10 @@ export function logReceiptText(text) {
   const form = new FormData();
   form.append('source', 'receipt');
   form.append('text', text.trim());
-  return request('/log-expense', { method: 'POST', body: form });
+  return requestJson('/log-expense', { method: 'POST', body: form });
 }
 
-export async function logReceiptPhoto(photo) {
+export function logReceiptPhoto(photo) {
   if (!photo?.uri) throw new Error('Take a receipt photo first.');
-  const name = photo.fileName || 'receipt.jpg';
-  const mime = photo.mimeType || 'image/jpeg';
-  const form = new FormData();
-  form.append('source', 'receipt');
-  await appendLocalFile(form, 'file', photo.uri, name, mime);
-  return request('/log-expense', { method: 'POST', body: form });
+  return uploadExpenseFile({ source: 'receipt', uri: photo.uri });
 }
