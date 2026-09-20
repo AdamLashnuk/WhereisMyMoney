@@ -18,9 +18,13 @@ async function request(path, options = {}) {
   } catch (error) {
     const message = String(error?.message || error);
     if (/Unsupported FormDataPart/i.test(message)) {
-      throw new Error('Upload failed (FormData). Pull latest feat/app and restart Expo with npx expo start -c.');
+      throw new Error('Upload failed (FormData). On Person A laptop: git pull feat/app && cd app && npm i && npx expo start -c');
     }
-    if (error instanceof TypeError || message === 'Network request failed' || /Failed to fetch|NetworkError/i.test(message)) {
+    if (
+      error instanceof TypeError
+      || message === 'Network request failed'
+      || /Failed to fetch|NetworkError/i.test(message)
+    ) {
       throw new Error('Cannot reach the backend. Check that your iPhone and Sebastian’s server are on the same Wi-Fi.');
     }
     throw error;
@@ -35,13 +39,24 @@ function postJSON(path, body) {
   });
 }
 
-/**
- * Expo's fetch rejects React Native {uri,name,type} FormData parts.
- * Use expo-file-system File objects (supported by expo/fetch).
- */
-function localFile(uri) {
+/** Build a FormData file part Expo fetch accepts (not RN {uri,name,type}). */
+async function appendLocalFile(form, field, uri, name, mime) {
   if (!uri) throw new Error('Missing local file URI.');
-  return new File(uri);
+  try {
+    form.append(field, new File(uri));
+    return;
+  } catch (_) {
+    // fall through
+  }
+  const response = await expoFetch(uri);
+  if (!response.ok) throw new Error('Could not read the local file for upload.');
+  const blob = await response.blob();
+  const type = mime || blob.type || 'application/octet-stream';
+  try {
+    form.append(field, new File([blob], name, { type }));
+  } catch (_) {
+    form.append(field, blob, name);
+  }
 }
 
 export const getExpenses = () => request('/expenses');
@@ -65,11 +80,29 @@ export function logTextExpense(text) {
   return request('/log-expense', { method: 'POST', body: form });
 }
 
-export function logVoiceExpense(uri) {
+function voiceFilename(uri) {
+  const last = String(uri).split('?')[0].split('/').pop() || '';
+  if (/\.(m4a|mp4|wav|mp3|aac|caf|webm|ogg)$/i.test(last)) return last;
+  return 'expense.m4a';
+}
+
+function voiceMime(name) {
+  const lower = String(name).toLowerCase();
+  if (lower.endsWith('.wav')) return 'audio/wav';
+  if (lower.endsWith('.mp3')) return 'audio/mpeg';
+  if (lower.endsWith('.webm')) return 'audio/webm';
+  if (lower.endsWith('.ogg')) return 'audio/ogg';
+  if (lower.endsWith('.aac')) return 'audio/aac';
+  if (lower.endsWith('.caf')) return 'audio/x-caf';
+  return 'audio/mp4';
+}
+
+export async function logVoiceExpense(uri) {
   if (!uri) throw new Error('Recording was empty. Please try again.');
+  const name = voiceFilename(uri);
   const form = new FormData();
   form.append('source', 'voice');
-  form.append('file', localFile(uri));
+  await appendLocalFile(form, 'file', uri, name, voiceMime(name));
   return request('/log-expense', { method: 'POST', body: form });
 }
 
@@ -81,10 +114,12 @@ export function logReceiptText(text) {
   return request('/log-expense', { method: 'POST', body: form });
 }
 
-export function logReceiptPhoto(photo) {
+export async function logReceiptPhoto(photo) {
   if (!photo?.uri) throw new Error('Take a receipt photo first.');
+  const name = photo.fileName || 'receipt.jpg';
+  const mime = photo.mimeType || 'image/jpeg';
   const form = new FormData();
   form.append('source', 'receipt');
-  form.append('file', localFile(photo.uri));
+  await appendLocalFile(form, 'file', photo.uri, name, mime);
   return request('/log-expense', { method: 'POST', body: form });
 }
