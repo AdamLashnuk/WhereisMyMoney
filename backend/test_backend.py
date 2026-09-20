@@ -708,11 +708,12 @@ def test_place_call_plays_elevenlabs_audio_via_twiml_url(monkeypatch, tmp_path) 
         assert ".mp3" not in body
         assert body.index("<Play>") < body.index("<Gather")
         assert 'input="speech dtmf"' in body
-        assert 'timeout="6"' in body
+        assert 'timeout="8"' in body
         assert "actionOnEmptyResult" in body
         assert "https://demo.ngrok-free.app/twiml/gather" in body
         assert "You can reply now" in body
-        assert "<Hangup/>" in body
+        assert "<Redirect>" in body
+        assert "<Hangup" not in body
 
         posted = client.post(f"/twiml/play/{token}")
         assert posted.status_code == 200
@@ -1192,7 +1193,16 @@ def test_render_play_twiml_play_only_when_gather_setup_fails(tmp_path, monkeypat
     assert "<Gather" not in xml
 
 
-def test_gather_ack_returns_hangup_twiml(monkeypatch, tmp_path) -> None:
+def _assert_keeps_listening(body: str) -> None:
+    assert "<Gather" in body
+    assert 'input="speech dtmf"' in body
+    assert "actionOnEmptyResult" in body
+    assert "/twiml/gather" in body
+    assert "<Redirect>" in body
+    assert "<Hangup" not in body
+
+
+def test_gather_ack_keeps_listening(monkeypatch, tmp_path) -> None:
     _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
     spoken: list[str] = []
     monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
@@ -1207,10 +1217,10 @@ def test_gather_ack_returns_hangup_twiml(monkeypatch, tmp_path) -> None:
         body = posted.text
         assert "<Response>" in body
         assert "<Play>" in body
-        assert "<Hangup/>" in body
-        assert "<Gather" not in body
+        _assert_keeps_listening(body)
         assert spoken
         assert "Got it" in spoken[0]
+        assert "Goodbye" not in spoken[0]
         assert "$" not in spoken[0]
 
 
@@ -1227,7 +1237,8 @@ def test_gather_logs_expense_from_speech(monkeypatch, tmp_path) -> None:
         assert posted.status_code == 200
         body = posted.text
         assert "<Play>" in body
-        assert "<Hangup/>" in body
+        _assert_keeps_listening(body)
+        assert "Goodbye" not in body
         history = client.get("/expenses").json()
         assert history["weekTotalCents"] == 2000
         assert history["expenses"][0]["category"] == "Food"
@@ -1273,6 +1284,7 @@ def test_gather_sets_limit_from_speech_heuristic(monkeypatch, tmp_path) -> None:
             data={"SpeechResult": "set food limit to thirty"},
         )
         assert posted.status_code == 200
+        _assert_keeps_listening(posted.text)
         assert client.get("/limits").json()["limits"]["Food"] == 3000
         assert spoken
         assert "thirty dollars" in spoken[0]
@@ -1302,13 +1314,14 @@ def test_gather_sets_limit_from_spoken_limit_parser(monkeypatch, tmp_path) -> No
             data={"SpeechResult": "cap my food spending at a hundred a week"},
         )
         assert posted.status_code == 200
+        _assert_keeps_listening(posted.text)
         assert client.get("/limits").json()["limits"]["Food"] == 10000
         assert spoken
         assert "one hundred dollars" in spoken[0]
         assert "$" not in spoken[0]
 
 
-def test_gather_empty_retries_then_goodbye(monkeypatch, tmp_path) -> None:
+def test_gather_empty_keeps_listening_silently(monkeypatch, tmp_path) -> None:
     _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
     spoken: list[str] = []
     monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
@@ -1316,19 +1329,18 @@ def test_gather_empty_retries_then_goodbye(monkeypatch, tmp_path) -> None:
     with TestClient(app) as client:
         first = client.post("/twiml/gather", data={"SpeechResult": ""})
         assert first.status_code == 200
-        assert "<Gather" in first.text
-        assert 'timeout="6"' in first.text
-        assert "attempt=1" in first.text
-        assert "<Hangup/>" in first.text
+        _assert_keeps_listening(first.text)
+        assert 'timeout="8"' in first.text
+        assert "<Play>" not in first.text
+        assert spoken == []
 
-        second = client.post("/twiml/gather?attempt=1", data={"SpeechResult": ""})
+        second = client.post("/twiml/gather", data={"SpeechResult": ""})
         assert second.status_code == 200
-        assert "<Gather" not in second.text
-        assert "<Hangup/>" in second.text
-        assert any("didn't hear" in line or "Goodbye" in line for line in spoken)
+        _assert_keeps_listening(second.text)
+        assert spoken == []
 
 
-def test_gather_unknown_retries_once(monkeypatch, tmp_path) -> None:
+def test_gather_unknown_keeps_listening(monkeypatch, tmp_path) -> None:
     _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
     spoken: list[str] = []
     monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
@@ -1339,18 +1351,19 @@ def test_gather_unknown_retries_once(monkeypatch, tmp_path) -> None:
             data={"SpeechResult": "what is the weather in Pittsburgh"},
         )
         assert first.status_code == 200
-        assert "<Gather" in first.text
-        assert "attempt=1" in first.text
+        _assert_keeps_listening(first.text)
         assert spoken
         assert "didn't catch" in spoken[0]
+        assert "Goodbye" not in spoken[0]
 
         second = client.post(
-            "/twiml/gather?attempt=1",
+            "/twiml/gather",
             data={"SpeechResult": "still nonsense"},
         )
         assert second.status_code == 200
-        assert "<Gather" not in second.text
-        assert "<Hangup/>" in second.text
+        _assert_keeps_listening(second.text)
+        assert len(spoken) == 2
+        assert "didn't catch" in spoken[1]
 
 
 def test_gather_falls_back_to_say_when_tts_fails(monkeypatch, tmp_path) -> None:
@@ -1369,7 +1382,9 @@ def test_gather_falls_back_to_say_when_tts_fails(monkeypatch, tmp_path) -> None:
         assert posted.status_code == 200
         body = posted.text
         assert "<Say>" in body
+        _assert_keeps_listening(body)
         assert "twenty dollars" in body
+        assert "Goodbye" not in body
         assert "$" not in body
         assert "CHF" not in body
         assert "2000" not in body
@@ -1388,14 +1403,42 @@ def test_gather_say_fallback_rewrites_raw_money(monkeypatch, tmp_path) -> None:
         lambda *_args, **_kwargs: type(
             "Outcome",
             (),
-            {"spoken": "You are over by $20.00 after CHF 54.50", "gather_again": False, "intent": "ack"},
+            {"spoken": "You are over by $20.00 after CHF 54.50", "gather_again": True, "intent": "ack"},
         )(),
     )
     with TestClient(app) as client:
         posted = client.post("/twiml/gather", data={"SpeechResult": "okay"})
         assert posted.status_code == 200
         body = posted.text
+        _assert_keeps_listening(body)
         assert "twenty dollars" in body
         assert "fifty-four dollars and fifty cents" in body
         assert "$" not in body
         assert "CHF" not in body
+
+
+def test_gather_multi_turn_expense_then_limit(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    spoken: list[str] = []
+    monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
+    _fresh_db()
+    with TestClient(app) as client:
+        first = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "I spent twenty dollars on lunch"},
+        )
+        assert first.status_code == 200
+        _assert_keeps_listening(first.text)
+        assert client.get("/expenses").json()["weekTotalCents"] == 2000
+
+        second = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "set food limit to eighty"},
+        )
+        assert second.status_code == 200
+        _assert_keeps_listening(second.text)
+        assert client.get("/limits").json()["limits"]["Food"] == 8000
+        assert client.get("/expenses").json()["weekTotalCents"] == 2000
+        assert any("twenty dollars" in line for line in spoken)
+        assert any("eighty dollars" in line for line in spoken)
+        assert all("Goodbye" not in line for line in spoken)

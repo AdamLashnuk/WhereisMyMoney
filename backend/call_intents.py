@@ -1,7 +1,8 @@
 """Demo intent routing for Twilio ``<Gather>`` speech on outbound calls.
 
 Keeps the loop small and reliable: acknowledge, log an expense, set a weekly
-limit, or retry once. Money in spoken replies always goes through
+limit, or ask the callee to try again. The call stays open after every reply
+until the callee hangs up. Money in spoken replies always goes through
 ``cents_to_speech`` / ``rewrite_money_for_speech``.
 """
 
@@ -27,12 +28,10 @@ logger = logging.getLogger("whereismymoney.gather")
 
 PARSE_LIMIT_SAVE_CONFIDENCE = 0.6
 
-ACK_SPEECH = "Got it. Thanks for listening. Goodbye."
-RETRY_SPEECH = "I didn't catch that. You can reply now."
-EMPTY_RETRY_SPEECH = "I didn't hear a reply. You can try again."
-GOODBYE_SPEECH = "Goodbye."
-STILL_UNCLEAR_SPEECH = "Sorry, I still didn't catch that. Goodbye."
-ERROR_SPEECH = "Sorry, something went wrong. Goodbye."
+ACK_SPEECH = "Got it."
+RETRY_SPEECH = "I didn't catch that. You can try again."
+EMPTY_RETRY_SPEECH = ""
+ERROR_SPEECH = "Sorry, something went wrong. You can try again."
 
 _ACK_RE = re.compile(
     r"^(?:(?:ok(?:ay)?|thanks?|thank you|got it|gotcha|yes|yeah|yep|yup|"
@@ -246,37 +245,37 @@ def _over_limit_clause(category: str) -> str:
 
 
 def _spoken(text: str) -> str:
-    return rewrite_money_for_speech((text or "").strip()) or GOODBYE_SPEECH
+    return rewrite_money_for_speech((text or "").strip())
 
 
 def handle_spoken_reply(
     text: str,
     *,
-    attempt: int = 0,
     speech_confidence: float | None = None,
 ) -> GatherOutcome:
-    """Interpret ``SpeechResult``, persist when needed, return a spoken reply."""
+    """Interpret ``SpeechResult``, persist when needed, return a spoken reply.
+
+    ``gather_again`` is always True — the TwiML loop keeps listening until the
+    callee hangs up.
+    """
     intent = classify_spoken_reply(text)
     logger.info(
-        "Gather intent=%s attempt=%s confidence=%s speech=%r",
+        "Gather intent=%s confidence=%s speech=%r",
         intent.name,
-        attempt,
         speech_confidence,
         intent.speech,
     )
 
     if intent.name == "empty":
-        if attempt <= 0:
-            return GatherOutcome("empty", _spoken(EMPTY_RETRY_SPEECH), True)
-        return GatherOutcome("empty", _spoken(GOODBYE_SPEECH), False)
+        return GatherOutcome("empty", _spoken(EMPTY_RETRY_SPEECH), True)
 
     if intent.name == "set_limit" and intent.category and intent.amount_cents is not None:
         set_limit(intent.category, int(intent.amount_cents))
         spoken = (
             f"Updated your {intent.category} weekly limit to "
-            f"{cents_to_speech(int(intent.amount_cents))}. Goodbye."
+            f"{cents_to_speech(int(intent.amount_cents))}."
         )
-        return GatherOutcome("set_limit", _spoken(spoken), False)
+        return GatherOutcome("set_limit", _spoken(spoken), True)
 
     if intent.name == "log_expense" and intent.parsed_expense is not None:
         parsed = intent.parsed_expense
@@ -291,13 +290,11 @@ def handle_spoken_reply(
         )
         spoken = (
             f"Logged {cents_to_speech(int(parsed.amount_cents))} on {parsed.category}."
-            f"{_over_limit_clause(parsed.category)} Goodbye."
+            f"{_over_limit_clause(parsed.category)}"
         )
-        return GatherOutcome("log_expense", _spoken(spoken), False)
+        return GatherOutcome("log_expense", _spoken(spoken), True)
 
     if intent.name == "ack":
-        return GatherOutcome("ack", _spoken(ACK_SPEECH), False)
+        return GatherOutcome("ack", _spoken(ACK_SPEECH), True)
 
-    if attempt <= 0:
-        return GatherOutcome("unknown", _spoken(RETRY_SPEECH), True)
-    return GatherOutcome("unknown", _spoken(STILL_UNCLEAR_SPEECH), False)
+    return GatherOutcome("unknown", _spoken(RETRY_SPEECH), True)

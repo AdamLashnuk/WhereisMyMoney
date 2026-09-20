@@ -66,7 +66,7 @@ curl -s -X POST http://127.0.0.1:8000/trigger-call \
 
 6. Confirm the JSON `call` object has `"voice": "elevenlabs"` and a `twimlUrl` under your ngrok origin (`/twiml/play/{token}`), not `twimlets.com`.
 7. Twilio fetches that TwiML, `<Play>`s `/call-audio/{token}.ulaw` (Victoria, `eleven_multilingual_v2`, `ulaw_8000`), then `<Gather input="speech dtmf">` with action `/twiml/gather`. Trial Twilio Gather works; only verified numbers can be dialed.
-8. After the alert, say **okay**, **I spent twenty dollars on lunch**, or **set food limit to fifty**. Reply audio uses the same Victoria μ-law path (or `<Say>` if TTS fails). Spoken money is USD English, never `$` / CHF / raw cents.
+8. After the alert, say **okay**, **I spent twenty dollars on lunch**, or **set food limit to fifty**. The bot replies, then listens again. Keep talking (log another expense, change a limit, or just say okay) until **you** hang up — the bot does not end the call. Reply audio uses the same Victoria μ-law path (or `<Say>` if TTS fails). Spoken money is USD English, never `$` / CHF / raw cents.
 9. If ElevenLabs fails **or** `PUBLIC_BASE_URL` is unset, `place_call` falls back to the trial-safe Twimlets `message` URL (Twilio `<Say>`, play-only — no Gather). If Gather TwiML cannot be built, `/twiml/play/{token}` still plays the alert.
 
 ## ngrok (phone app + Twilio)
@@ -102,7 +102,7 @@ Outbound calls that play **ElevenLabs Victoria** and then listen for a spoken re
 | `GET` | `/expenses` | Current week only |
 | `POST` | `/trigger-call` | `{ kind, category?, phoneNumber? }`. Optional `phoneNumber` is a one-time E.164-ish override (min 8 digits). If omitted, dials saved settings / `MY_PHONE_NUMBER`. |
 | `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` the alert, then `<Gather>` speech (needs a cached μ-law file). Play-only if Gather setup fails. |
-| `GET`/`POST` | `/twiml/gather` | Twilio Gather webhook. Form fields `SpeechResult` + optional `Confidence`. Returns TwiML that speaks a reply (ElevenLabs `<Play>` or `<Say>`) and hangs up, or one re-Gather. |
+| `GET`/`POST` | `/twiml/gather` | Twilio Gather webhook. Form fields `SpeechResult` + optional `Confidence`. Speaks a reply (ElevenLabs `<Play>` or `<Say>`), then Gathers again until the callee hangs up. |
 | `GET` | `/call-audio/{token}.ulaw` | Cached ElevenLabs 8 kHz μ-law (`audio/x-mulaw`) Twilio fetches after `<Play>` |
 
 Example without an audio file:

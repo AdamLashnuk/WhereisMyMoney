@@ -407,14 +407,6 @@ def twiml_play(token: str, request: Request) -> Response:
     return _play_twiml_response(token, request)
 
 
-def _parse_gather_attempt(request: Request) -> int:
-    raw = request.query_params.get("attempt")
-    try:
-        return max(0, int(raw or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
 def _optional_confidence(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -440,32 +432,17 @@ async def _speech_from_request(request: Request) -> tuple[str, float | None]:
 
 @app.api_route("/twiml/gather", methods=["GET", "POST"])
 async def twiml_gather(request: Request) -> Response:
-    """Twilio Gather webhook: SpeechResult → spoken reply TwiML (Play or Say)."""
+    """Twilio Gather webhook: SpeechResult → spoken reply, then listen again."""
     base = public_base_url() or str(request.base_url).rstrip("/")
     try:
-        attempt = _parse_gather_attempt(request)
         speech, confidence = await _speech_from_request(request)
-        logger.info(
-            "Gather SpeechResult=%r Confidence=%s attempt=%s",
-            speech,
-            confidence,
-            attempt,
-        )
-        outcome = handle_spoken_reply(
-            speech,
-            attempt=attempt,
-            speech_confidence=confidence,
-        )
-        xml = render_spoken_twiml(
-            outcome.spoken,
-            base=base,
-            gather_again=outcome.gather_again,
-            attempt=attempt,
-        )
+        logger.info("Gather SpeechResult=%r Confidence=%s", speech, confidence)
+        outcome = handle_spoken_reply(speech, speech_confidence=confidence)
+        xml = render_spoken_twiml(outcome.spoken, base=base, gather_again=True)
         return Response(content=xml, media_type="application/xml")
     except Exception:
         logger.exception("Gather webhook failed")
-        xml = render_spoken_twiml(ERROR_SPEECH, base=base, gather_again=False)
+        xml = render_spoken_twiml(ERROR_SPEECH, base=base, gather_again=True)
         return Response(content=xml, media_type="application/xml")
 
 
