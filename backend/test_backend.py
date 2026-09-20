@@ -22,7 +22,7 @@ os.environ.pop("CALL_AUDIO_DIR", None)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from categorizer import UnknownAmountError, parse_expense, parse_receipt_image  # noqa: E402
+from categorizer import UnknownAmountError, parse_expense, parse_expenses, parse_receipt_image  # noqa: E402
 from db import (  # noqa: E402
     CATEGORIES,
     configure_db,
@@ -87,6 +87,55 @@ def test_parse_demo_phrases() -> None:
     receipt = parse_expense("RECEIPT TOTAL 14.00 LUNCH")
     assert receipt.amount_cents == 1400
     assert receipt.category == "Food"
+
+
+def test_parse_expenses_single_item_still_works() -> None:
+    items = parse_expenses("spent fourteen bucks on lunch")
+    assert len(items) == 1
+    assert items[0].amount_cents == 1400
+    assert items[0].category == "Food"
+    assert items[0].original_text == "spent fourteen bucks on lunch"
+
+    combined = parse_expenses("thirty two forty five on groceries")
+    assert len(combined) == 1
+    assert combined[0].amount_cents == 3245
+
+    hundred = parse_expenses("a hundred and fifty on groceries")
+    assert len(hundred) == 1
+    assert hundred[0].category == "Food"
+
+
+def test_parse_expenses_multi_spoken_list() -> None:
+    items = parse_expenses("twelve dollars on drinks and five hundred on groceries")
+    assert len(items) == 2
+    assert items[0].amount_cents == 1200
+    assert items[0].category == "Food"
+    assert items[1].amount_cents == 50000
+    assert items[1].category == "Food"
+
+    digits = parse_expenses("12 dollars on drinks and 500 on groceries")
+    assert [i.amount_cents for i in digits] == [1200, 50000]
+
+    commas = parse_expenses("14 on lunch, 20 on parking")
+    assert len(commas) == 2
+    assert commas[0].amount_cents == 1400
+    assert commas[0].category == "Food"
+    assert commas[1].amount_cents == 2000
+    assert commas[1].category == "Transport"
+
+    longer = parse_expenses("12 dollars on drinks, 500 on groceries, and 8 on the bus")
+    assert len(longer) == 3
+    assert [i.amount_cents for i in longer] == [1200, 50000, 800]
+    assert longer[2].category == "Transport"
+
+
+def test_parse_expenses_empty_and_garbage_fail() -> None:
+    for text in ("", "   ", "asdfasdf", "hello there", "paid nothing useful"):
+        try:
+            parse_expenses(text)
+            raise AssertionError(f"expected UnknownAmountError for {text!r}")
+        except UnknownAmountError as exc:
+            assert "amount" in str(exc).lower()
 
 
 def test_twilio_missing_keys_does_not_raise() -> None:
@@ -1061,6 +1110,137 @@ def test_log_expense_receipt_text_still_uses_parser() -> None:
         assert payload["parse"]["engine"] == "heuristic"
         assert payload["expense"]["amountCents"] == 1400
         assert payload["expense"]["category"] == "Food"
+
+
+def test_log_expense_single_item_returns_expense_and_expenses() -> None:
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={"source": "voice", "text": "spent fourteen bucks on lunch"},
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert payload["expense"]["amountCents"] == 1400
+        assert payload["parse"]["itemCount"] == 1
+        assert len(payload["expenses"]) == 1
+        assert payload["expenses"][0]["id"] == payload["expense"]["id"]
+        assert payload["results"][0]["expense"]["id"] == payload["expense"]["id"]
+        history = client.get("/expenses").json()["expenses"]
+        assert len(history) == 1
+        assert history[0]["amountCents"] == 1400
+
+
+def test_log_expense_multi_spoken_list_creates_two_rows() -> None:
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={
+                "source": "voice",
+                "text": "twelve dollars on drinks and five hundred on groceries",
+            },
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert payload["parse"]["itemCount"] == 2
+        assert payload["expense"]["amountCents"] == 1200
+        assert payload["expense"]["category"] == "Food"
+        amounts = [row["amountCents"] for row in payload["expenses"]]
+        categories = [row["category"] for row in payload["expenses"]]
+        assert amounts == [1200, 50000]
+        assert categories == ["Food", "Food"]
+        assert len(payload["results"]) == 2
+        assert payload["results"][0]["expense"]["id"] == payload["expense"]["id"]
+        history = client.get("/expenses").json()
+        history_amounts = sorted(row["amountCents"] for row in history["expenses"])
+        assert history_amounts == [1200, 50000]
+        assert history["totalsByCategory"]["Food"] == 51200
+
+
+def test_log_expense_empty_and_garbage_fail_cleanly() -> None:
+    _fresh_db()
+    with TestClient(app) as client:
+        for text in ("asdfasdf hello", "hmm not sure"):
+            posted = client.post("/log-expense", data={"source": "voice", "text": text})
+            assert posted.status_code == 400, text
+            body = posted.json()
+            assert body["ok"] is False
+            assert "amount" in str(body.get("error") or "").lower()
+        assert client.get("/expenses").json()["expenses"] == []
+
+
+def test_log_expense_multi_checks_limit_once_per_category(monkeypatch) -> None:
+    calls: list[tuple[str | None, str]] = []
+
+    def fake_place(to, spoken):
+        calls.append((to, spoken))
+        return {"ok": False, "error": "Twilio is not configured", "to": to}
+
+    monkeypatch.setattr("main.place_call", fake_place)
+    _fresh_db()
+    with TestClient(app) as client:
+        assert client.post("/limits", json={"category": "Food", "limitCents": 1000}).status_code == 200
+        posted = client.post(
+            "/log-expense",
+            data={
+                "source": "voice",
+                "text": "twelve dollars on drinks and five hundred on groceries",
+            },
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert len(payload["expenses"]) == 2
+        assert payload["limitCheck"]["category"] == "Food"
+        assert payload["limitCheck"]["weekTotalCents"] == 51200
+        assert payload["limitCheck"]["overByCents"] == 50200
+        assert payload["limitCheck"]["action"] == "call_failed"
+        assert len(payload["limitChecks"]) == 1
+        assert len(calls) == 1
+
+
+def test_log_expense_nemotron_list_extract(monkeypatch) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+
+    def fake_list(text: str) -> dict:
+        assert "drinks" in text and "groceries" in text
+        return {
+            "nemotron_failed": False,
+            "expenses": [
+                {
+                    "original_text": "twelve dollars on drinks",
+                    "merchant": None,
+                    "amount_cents": 1200,
+                    "category": "Food",
+                    "confidence": 0.9,
+                    "needs_review": False,
+                },
+                {
+                    "original_text": "five hundred on groceries",
+                    "merchant": None,
+                    "amount_cents": 50000,
+                    "category": "Food",
+                    "confidence": 0.91,
+                    "needs_review": False,
+                },
+            ],
+        }
+
+    monkeypatch.setattr("ai.categorize.categorize_expenses", fake_list)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={
+                "source": "voice",
+                "text": "twelve dollars on drinks and five hundred on groceries",
+            },
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert payload["parse"]["engine"] == "nemotron"
+        assert payload["parse"]["itemCount"] == 2
+        assert [row["amountCents"] for row in payload["expenses"]] == [1200, 50000]
 
 
 def test_parse_limit_returns_spoken_dict_without_saving(monkeypatch) -> None:

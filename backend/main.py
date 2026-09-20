@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from categorizer import UnknownAmountError, parse_expense, parse_receipt_image
+from categorizer import UnknownAmountError, parse_expense, parse_expenses, parse_receipt_image
 from db import (
     CATEGORIES,
     USER_ID,
@@ -525,23 +525,88 @@ def _original_text(
     )
 
 
-def _expense_payload(parsed, source: str, text_engine: str, swap: str) -> dict[str, Any]:
-    expense = insert_expense(
-        original_text=parsed.original_text,
-        source=source,
-        merchant=parsed.merchant,
-        amount_cents=int(parsed.amount_cents),
-        category=parsed.category,
-        confidence=parsed.confidence,
-        needs_review=parsed.needs_review,
-    )
+def _pick_limit_check(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    """One representative check for backward-compatible ``limitCheck``.
+
+    Prefer a check that placed (or attempted) a call, then any over-limit
+    category, else the first category in the batch.
+    """
+    if not checks:
+        return {
+            "category": None,
+            "weekTotalCents": 0,
+            "limitCents": 0,
+            "overByCents": 0,
+            "action": "nothing",
+            "note": None,
+            "call": None,
+        }
+    for preferred in ("placed_call", "call_failed", "already_called"):
+        for check in checks:
+            if check.get("action") == preferred and int(check.get("overByCents") or 0) > 0:
+                return check
+    for check in checks:
+        if int(check.get("overByCents") or 0) > 0:
+            return check
+    return checks[0]
+
+
+def _expense_payload(parsed_items, source: str, text_engine: str, swap: str) -> dict[str, Any]:
+    """Persist each parsed item, then run at most one over-limit check per category.
+
+    Inserts happen first so week totals include the whole spoken list. Limit
+    checks then run once per distinct category in the batch — never N Twilio
+    attempts for N items in the same category. ``expense`` is the first row
+    (Expo currently reads that); ``expenses`` / ``results`` list every row.
+    """
+    if not isinstance(parsed_items, (list, tuple)):
+        parsed_items = [parsed_items]
+    if not parsed_items:
+        raise UnknownAmountError(
+            "Could not determine an amount in cents from the text. "
+            "Please include a dollar amount and try again."
+        )
+
+    expenses: list[dict[str, Any]] = []
+    for parsed in parsed_items:
+        expenses.append(
+            insert_expense(
+                original_text=parsed.original_text,
+                source=source,
+                merchant=parsed.merchant,
+                amount_cents=int(parsed.amount_cents),
+                category=parsed.category,
+                confidence=parsed.confidence,
+                needs_review=parsed.needs_review,
+            )
+        )
+
+    ordered_categories: list[str] = []
+    for parsed in parsed_items:
+        if parsed.category not in ordered_categories:
+            ordered_categories.append(parsed.category)
+    checks_by_category = {category: _maybe_over_limit_call(category) for category in ordered_categories}
+    limit_checks = [checks_by_category[category] for category in ordered_categories]
+    results = [
+        {"expense": expense, "limitCheck": checks_by_category[parsed.category]}
+        for expense, parsed in zip(expenses, parsed_items)
+    ]
+    engines = [parsed.engine for parsed in parsed_items]
+    engine = engines[0]
+    if len(set(engines)) > 1:
+        engine = "nemotron" if "nemotron" in engines else engines[0]
+
     return {
-        "expense": expense,
-        "limitCheck": _maybe_over_limit_call(parsed.category),
+        "expense": expenses[0],
+        "expenses": expenses,
+        "results": results,
+        "limitCheck": _pick_limit_check(limit_checks),
+        "limitChecks": limit_checks,
         "parse": {
-            "engine": parsed.engine,
+            "engine": engine,
             "textEngine": text_engine,
             "swap": swap,
+            "itemCount": len(expenses),
         },
     }
 
@@ -552,7 +617,12 @@ async def log_expense(
     file: UploadFile | None = File(None),
     text: str | None = Form(None),
 ) -> dict[str, Any]:
-    """Voice or receipt → persist expense → run the weekly limit check."""
+    """Voice or receipt → persist expense(s) → run the weekly limit check.
+
+    Voice transcripts may list multiple spends in one take. Each item becomes
+    its own ledger row. ``expense`` is the first row (backward compatible);
+    ``expenses`` / ``results`` list every row.
+    """
     upload, filename, content_type = await _read_upload(file)
     started = time.perf_counter()
     try:
@@ -574,7 +644,7 @@ async def log_expense(
                 parsed.amount_cents,
             )
             return _expense_payload(
-                parsed,
+                [parsed],
                 source,
                 "receipt",
                 "ai.receipt.categorize_receipt (nvidia/nemotron-3-nano-omni vision).",
@@ -590,21 +660,26 @@ async def log_expense(
         )
         stt_ms = (time.perf_counter() - stt_started) * 1000
         parse_started = time.perf_counter()
-        parsed = parse_expense(original)
+        if source == "voice":
+            parsed_items = parse_expenses(original)
+        else:
+            parsed_items = [parse_expense(original)]
         parse_ms = (time.perf_counter() - parse_started) * 1000
         logger.info(
-            "log-expense source=%s stt_ms=%.0f nemotron_ms=%.0f textEngine=%s parseEngine=%s",
+            "log-expense source=%s stt_ms=%.0f nemotron_ms=%.0f textEngine=%s parseEngine=%s itemCount=%s",
             source,
             stt_ms,
             parse_ms,
             engine,
-            parsed.engine,
+            parsed_items[0].engine,
+            len(parsed_items),
         )
         return _expense_payload(
-            parsed,
+            parsed_items,
             source,
             engine,
-            "ai.categorize.categorize_expense when NVIDIA_API_KEY is set; heuristic fallback otherwise.",
+            "ai.categorize.categorize_expenses (voice lists) or categorize_expense "
+            "when NVIDIA_API_KEY is set; heuristic split/fallback otherwise.",
         )
     except UnknownAmountError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

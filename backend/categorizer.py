@@ -24,9 +24,12 @@ Category = str
 # ---------------------------------------------------------------------------
 # SWAP INTERFACE (Person C / NVIDIA Nemotron)
 # ---------------------------------------------------------------------------
-# ``parse_expense(text) -> ParsedExpense`` is the text parse entry point.
-# When NVIDIA_API_KEY is set, the body calls ai.categorize.categorize_expense
-# and maps the dict onto ParsedExpense. On missing key / Nemotron failure it
+# ``parse_expense(text) -> ParsedExpense`` is the single-item text parse.
+# ``parse_expenses(text) -> list[ParsedExpense]`` splits a spoken list into
+# N ≥ 1 items (voice /log-expense). When NVIDIA_API_KEY is set, that path
+# prefers ai.categorize.categorize_expenses; otherwise a heuristic splits on
+# "and" / commas / repeated money patterns. parse_expense still uses
+# categorize_expense for one fragment. On missing key / Nemotron failure it
 # uses the heuristic below so the demo still works offline.
 # Receipt **images** use ``parse_receipt_image`` → ai.receipt.categorize_receipt
 # and never invent cents via the heuristic.
@@ -90,6 +93,8 @@ _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "restaurant",
         "cafe",
         "snack",
+        "drink",
+        "drinks",
         "meal",
         "takeout",
         "doordash",
@@ -425,6 +430,185 @@ def parse_expense(text: str) -> ParsedExpense:
         if nemotron is not None:
             return nemotron
     return _heuristic_parse_expense(original)
+
+
+_NUMBER_WORD_ALT = (
+    "zero|oh|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    "thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    "thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand"
+)
+_MONEY_START_RE = re.compile(
+    r"(?:\$\s*\d{1,6}(?:\.\d{1,2})?)"
+    r"|(?:\d{1,6}(?:\.\d{1,2})?\s*(?:dollars?|bucks|usd|cents?))"
+    rf"|(?:\b(?:{_NUMBER_WORD_ALT})(?:\s+(?:{_NUMBER_WORD_ALT}))*\s*(?:dollars?|bucks|usd|cents?))"
+    rf"|(?:\b(?:{_NUMBER_WORD_ALT})(?:\s+(?:{_NUMBER_WORD_ALT}))*(?=\s+(?:on|for|at|from)\b))"
+    r"|(?:\b\d{1,6}(?:\.\d{1,2})?(?=\s+(?:on|for|at|from)\b))",
+    re.IGNORECASE,
+)
+
+
+def _protect_number_and(text: str) -> str:
+    """Keep 'hundred and fifty' / 'dollars and fifty cents' as one amount."""
+    out = re.sub(r"\b(hundred|thousand)\s+and\s+", r"\1 ", text, flags=re.I)
+    out = re.sub(
+        r"\b(dollars?|bucks|usd)\s+and\s+"
+        rf"((?:\d{{1,2}}|{_NUMBER_WORD_ALT})(?:\s+{_NUMBER_WORD_ALT})*)\s+cents?\b",
+        r"\1 \2 cents",
+        out,
+        flags=re.I,
+    )
+    return out
+
+
+def _has_positive_amount(text: str) -> bool:
+    amount = extract_amount_cents(text)
+    return amount is not None and amount > 0
+
+
+def _merge_amount_parts(parts: list[str]) -> list[str]:
+    """Keep parts with amounts; glue amount-less fragments onto neighbors."""
+    merged: list[str] = []
+    pending: list[str] = []
+    for part in parts:
+        if _has_positive_amount(part):
+            prefix = " ".join(pending)
+            merged.append(f"{prefix} {part}".strip() if prefix else part)
+            pending = []
+        else:
+            pending.append(part)
+    if pending and merged:
+        merged[-1] = f"{merged[-1]} {' '.join(pending)}".strip()
+    elif pending:
+        merged.append(" ".join(pending))
+    return merged
+
+
+def _split_on_money_spans(text: str) -> list[str]:
+    """Split when two or more money patterns appear in one take."""
+    matches = [m for m in _MONEY_START_RE.finditer(text) if m.group().strip()]
+    filtered: list[re.Match[str]] = []
+    for match in matches:
+        if filtered and re.search(r"cents?$", match.group(), re.I):
+            continue
+        filtered.append(match)
+    if len(filtered) < 2:
+        return [text.strip()] if text.strip() else []
+
+    chunks: list[str] = []
+    for i, match in enumerate(filtered):
+        end = filtered[i + 1].start() if i + 1 < len(filtered) else len(text)
+        chunk = text[match.start() : end].strip(" .,;:")
+        if chunk:
+            chunks.append(chunk)
+    preamble = text[: filtered[0].start()].strip()
+    if preamble and chunks:
+        chunks[0] = f"{preamble} {chunks[0]}".strip()
+    usable = [c for c in chunks if _has_positive_amount(c)]
+    return usable if len(usable) >= 2 else [text.strip()]
+
+
+def split_expense_utterance(text: str) -> list[str]:
+    """Split spoken text into fragments that each look like one expense.
+
+    Prefers ``and`` / commas; falls back to repeated money patterns. Number
+    constructions like ``a hundred and fifty`` are not split.
+    """
+    original = (text or "").strip()
+    if not original:
+        return []
+
+    protected = _protect_number_and(original)
+    parts = [
+        re.sub(r"^(?:and\s+)", "", p.strip(" .,;:"), flags=re.I).strip(" .,;:")
+        for p in re.split(r"\s+and\s+|,\s*", protected, flags=re.I)
+        if p.strip(" .,;:")
+    ]
+    parts = [p for p in parts if p]
+    if len(parts) >= 2:
+        merged = _merge_amount_parts(parts)
+        if sum(1 for part in merged if _has_positive_amount(part)) >= 2:
+            return merged
+
+    spanned = _split_on_money_spans(protected)
+    if len(spanned) >= 2:
+        return spanned
+    return [original]
+
+
+def _try_nemotron_parse_list(original: str) -> list[ParsedExpense] | None:
+    """Return a list from Nemotron, or None to use the heuristic splitter.
+
+    An empty list means the model ran but found no amounts — caller may still
+    try the heuristic. ``None`` means the API/import failed.
+    """
+    try:
+        from ai.categorize import categorize_expenses
+    except Exception:
+        return None
+
+    try:
+        data = categorize_expenses(original)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    if data.get("nemotron_failed"):
+        return None
+
+    items = data.get("expenses")
+    if not isinstance(items, list):
+        return None
+
+    parsed: list[ParsedExpense] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fragment = (
+            item.get("original_text")
+            or item.get("original")
+            or item.get("fragment")
+            or original
+        )
+        try:
+            parsed.append(_from_nemotron_dict(str(fragment), item, engine="nemotron"))
+        except UnknownAmountError:
+            continue
+    return parsed
+
+
+def parse_expenses(text: str) -> list[ParsedExpense]:
+    """Parse spoken text into N ≥ 1 expenses.
+
+    Prefers Nemotron list extraction when ``NVIDIA_API_KEY`` is set. Falls back
+    to splitting on ``and`` / commas / repeated money, then ``parse_expense``
+    per fragment (which may still use single-item Nemotron). Raises
+    ``UnknownAmountError`` when nothing with a positive amount can be parsed.
+    """
+    original = text if text is not None else ""
+    if not str(original).strip():
+        raise UnknownAmountError(
+            "Could not determine an amount in cents from the text. "
+            "Please include a dollar amount and try again."
+        )
+
+    if _nemotron_available():
+        items = _try_nemotron_parse_list(original)
+        if items:
+            return items
+
+    fragments = split_expense_utterance(original)
+    parsed: list[ParsedExpense] = []
+    for fragment in fragments or [original]:
+        item = parse_expense(fragment)
+        if item.amount_cents > 0:
+            parsed.append(item)
+    if not parsed:
+        raise UnknownAmountError(
+            "Could not determine an amount in cents from the text. "
+            "Please include a dollar amount and try again."
+        )
+    return parsed
 
 
 def _heuristic_parse_expense(text: str) -> ParsedExpense:
