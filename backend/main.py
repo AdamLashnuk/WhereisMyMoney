@@ -742,11 +742,13 @@ def trigger_call(body: TriggerCallBody) -> dict[str, Any]:
             "limitCents": limit,
             "overByCents": over_by,
             "message": spoken,
+            "to": dest,
             "calledAt": logged["calledAt"],
             "error": call.get("error"),
         }
 
     result = place_weekly_summary_call(force=True, phone_number=body.phoneNumber)
+    call = result.get("call") or {}
     return {
         "ok": bool(result.get("ok")),
         "kind": "weekly_summary",
@@ -754,7 +756,8 @@ def trigger_call(body: TriggerCallBody) -> dict[str, Any]:
         "message": result.get("message"),
         "weekTotalCents": result.get("weekTotalCents"),
         "totalsByCategory": result.get("totalsByCategory"),
-        "calledAt": (result.get("call") or {}).get("calledAt"),
+        "to": call.get("to"),
+        "calledAt": call.get("calledAt"),
         "error": result.get("error"),
     }
 

@@ -205,10 +205,12 @@ def test_trigger_call_phone_number_override(monkeypatch) -> None:
         )
         assert weekly.status_code == 200
         assert captured["to"] == "+15555550999"
+        assert weekly.json()["to"] == "+15555550999"
 
         default = client.post("/trigger-call", json={"kind": "weekly_summary"})
         assert default.status_code == 200
         assert captured["to"] == "+15555550111"
+        assert default.json()["to"] == "+15555550111"
 
         over = client.post(
             "/trigger-call",
@@ -216,6 +218,7 @@ def test_trigger_call_phone_number_override(monkeypatch) -> None:
         )
         assert over.status_code == 200
         assert captured["to"] == "+15555550888"
+        assert over.json()["to"] == "+15555550888"
 
         bad = client.post("/trigger-call", json={"kind": "weekly_summary", "phoneNumber": "12"})
         assert bad.status_code == 400

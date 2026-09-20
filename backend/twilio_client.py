@@ -136,6 +136,7 @@ def place_call(to: str | None, spoken_text: str) -> dict[str, Any]:
         return {
             "ok": False,
             "error": "Twilio is not configured (set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER)",
+            "to": dest or None,
         }
     if not dest:
         return {"ok": False, "error": "No destination phone number in settings or MY_PHONE_NUMBER"}
