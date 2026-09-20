@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from pathlib import Path
@@ -559,6 +560,7 @@ async def log_expense(
 ) -> dict[str, Any]:
     """Voice or receipt → persist expense → run the weekly limit check."""
     upload, filename, content_type = await _read_upload(file)
+    started = time.perf_counter()
     try:
         if source == "receipt" and upload and _looks_like_image(filename, upload, content_type):
             suffix = Path(filename).suffix.lower() if filename else ""
@@ -568,14 +570,15 @@ async def log_expense(
                 tmp.write(upload)
                 tmp_path = tmp.name
             try:
-                label = Path(filename).name if filename else f"receipt{suffix}"
-                parsed = parse_receipt_image(
-                    tmp_path,
-                    original_text=f"[receipt photo: {label}]",
-                )
+                parsed = parse_receipt_image(tmp_path)
             finally:
                 with suppress(OSError):
                     os.unlink(tmp_path)
+            logger.info(
+                "log-expense source=receipt vision_ms=%.0f amount_cents=%s",
+                (time.perf_counter() - started) * 1000,
+                parsed.amount_cents,
+            )
             return _expense_payload(
                 parsed,
                 source,
@@ -583,6 +586,7 @@ async def log_expense(
                 "ai.receipt.categorize_receipt (nvidia/nemotron-3-nano-omni vision).",
             )
 
+        stt_started = time.perf_counter()
         original, engine = _original_text(
             source=source,
             text=text,
@@ -590,7 +594,18 @@ async def log_expense(
             filename=filename,
             content_type=content_type,
         )
+        stt_ms = (time.perf_counter() - stt_started) * 1000
+        parse_started = time.perf_counter()
         parsed = parse_expense(original)
+        parse_ms = (time.perf_counter() - parse_started) * 1000
+        logger.info(
+            "log-expense source=%s stt_ms=%.0f nemotron_ms=%.0f textEngine=%s parseEngine=%s",
+            source,
+            stt_ms,
+            parse_ms,
+            engine,
+            parsed.engine,
+        )
         return _expense_payload(
             parsed,
             source,
