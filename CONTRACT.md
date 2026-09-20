@@ -9,6 +9,7 @@ Money is always whole cents (integers). Exactly six categories: Food, Transport,
 - `POST /limits` / `GET /limits` — `POST` body remains `{ category, limitCents }`
 - `POST /settings` / `GET /settings`
 - `GET /expenses`
-- `POST /trigger-call`
+- `GET /health` — `{ status, whisperStub, twilioConfigured, nemotronConfigured, receiptOcrEnabled, capabilities: { receiptOCR, voiceStt, nemotron } }`. Receipt vision is advertised when `NVIDIA_API_KEY` is set.
+- `POST /trigger-call` — `{ kind, category?, phoneNumber? }`. Optional `phoneNumber` is a one-time E.164-ish override (does not persist settings).
 - `GET`/`POST` `/twiml/play/{token}` — TwiML `<Play>` for Twilio outbound calls
 - `GET /call-audio/{token}.ulaw` — cached ElevenLabs 8 kHz μ-law (`audio/x-mulaw`)

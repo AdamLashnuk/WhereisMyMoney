@@ -81,6 +81,18 @@ const parsed = await res.json();
 // If parsed.readyToSave, then POST /limits with { category, limitCents: amount_cents }
 ```
 
+### Trigger a weekly summary call (optional one-time number)
+
+```js
+await fetch(`${API_BASE_URL}/trigger-call`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ kind: 'weekly_summary', phoneNumber: '+1XXXXXXXXXX' }),
+});
+```
+
+`phoneNumber` is optional. When set, the backend dials that number once and does not change saved Settings. Trial Twilio accounts can dial only verified numbers.
+
 ### Log a receipt photo
 
 ```js

@@ -100,6 +100,10 @@ def test_health_and_defaults() -> None:
         assert body["twilioConfigured"] is False
         assert body["whisperStub"] is True
         assert body["nemotronConfigured"] is False
+        assert body["receiptOcrEnabled"] is False
+        assert body["capabilities"]["receiptOCR"] is False
+        assert body["capabilities"]["nemotron"] is False
+        assert body["capabilities"]["voiceStt"] is False
 
         settings = client.get("/settings").json()["settings"]
         assert settings["callDay"] == 0
@@ -176,6 +180,66 @@ def test_settings_and_trigger_call() -> None:
         over = client.post("/trigger-call", json={"kind": "over_limit", "category": "Food"})
         assert over.status_code == 200
         assert over.json()["ok"] is False
+
+
+def test_trigger_call_phone_number_override(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_place(to, spoken):
+        captured["to"] = to
+        captured["spoken"] = spoken
+        return {"ok": False, "error": "Twilio is not configured", "to": to}
+
+    monkeypatch.setattr("main.place_call", fake_place)
+    _fresh_db()
+    with TestClient(app) as client:
+        saved = client.post(
+            "/settings",
+            json={"callDay": 0, "callHour": 18, "phoneNumber": "+15555550111"},
+        )
+        assert saved.status_code == 200
+
+        weekly = client.post(
+            "/trigger-call",
+            json={"kind": "weekly_summary", "phoneNumber": "+15555550999"},
+        )
+        assert weekly.status_code == 200
+        assert captured["to"] == "+15555550999"
+        assert weekly.json()["to"] == "+15555550999"
+
+        default = client.post("/trigger-call", json={"kind": "weekly_summary"})
+        assert default.status_code == 200
+        assert captured["to"] == "+15555550111"
+        assert default.json()["to"] == "+15555550111"
+
+        over = client.post(
+            "/trigger-call",
+            json={"kind": "over_limit", "category": "Food", "phoneNumber": "+15555550888"},
+        )
+        assert over.status_code == 200
+        assert captured["to"] == "+15555550888"
+        assert over.json()["to"] == "+15555550888"
+
+        bad = client.post("/trigger-call", json={"kind": "weekly_summary", "phoneNumber": "12"})
+        assert bad.status_code == 400
+        err = bad.json()
+        assert "phone" in str(err.get("error") or "").lower()
+
+
+def test_health_advertises_receipt_ocr_when_nvidia_key(monkeypatch) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+    monkeypatch.setenv("WHISPER_STUB", "0")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-elevenlabs-key")
+    _fresh_db()
+    with TestClient(app) as client:
+        body = client.get("/health").json()
+        assert body["status"] == "ok"
+        assert body["nemotronConfigured"] is True
+        assert body["receiptOcrEnabled"] is True
+        assert body["capabilities"]["receiptOCR"] is True
+        assert body["capabilities"]["nemotron"] is True
+        assert body["capabilities"]["voiceStt"] is True
+        assert body["whisperStub"] is False
 
 
 def test_insert_helper_keeps_original_text() -> None:
@@ -393,6 +457,7 @@ def test_elevenlabs_transcription_uses_mocked_http(monkeypatch, tmp_path) -> Non
     files = captured["files"]
     assert isinstance(files, dict)
     assert files["file"][0] == "sample.mp3"
+    assert files["file"][2] == "audio/mpeg"
 
 
 def test_elevenlabs_missing_key_falls_back_to_stub(monkeypatch, tmp_path) -> None:
@@ -748,6 +813,71 @@ def test_log_expense_receipt_image_does_not_use_text_stub(monkeypatch) -> None:
         body = posted.json()
         assert body["ok"] is False
         assert "amount" in str(body.get("error") or "").lower()
+
+
+def test_log_expense_voice_file_uses_elevenlabs_and_nemotron(monkeypatch) -> None:
+    monkeypatch.setenv("WHISPER_STUB", "0")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-elevenlabs-key")
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+
+    def fake_transcribe(path, **_kwargs):
+        assert Path(path).is_file()
+        assert Path(path).stat().st_size > 0
+        assert Path(path).suffix.lower() == ".m4a"
+        return "spent fourteen bucks on lunch", "elevenlabs"
+
+    def fake_categorize(text: str) -> dict:
+        assert text == "spent fourteen bucks on lunch"
+        return {
+            "original_text": text,
+            "merchant": None,
+            "amount_cents": 1400,
+            "category": "Food",
+            "confidence": 0.94,
+            "needs_review": False,
+            "nemotron_failed": False,
+        }
+
+    monkeypatch.setattr("main.transcribe_audio", fake_transcribe)
+    monkeypatch.setattr("ai.categorize.categorize_expense", fake_categorize)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={"source": "voice"},
+            files={"file": ("expense.m4a", b"fake-m4a-bytes", "audio/mp4")},
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert payload["parse"]["textEngine"] == "elevenlabs"
+        assert payload["parse"]["engine"] == "nemotron"
+        assert payload["expense"]["originalText"] == "spent fourteen bucks on lunch"
+        assert payload["expense"]["amountCents"] == 1400
+        assert payload["expense"]["source"] == "voice"
+
+
+def test_log_expense_voice_file_prefers_audio_over_form_text(monkeypatch) -> None:
+    monkeypatch.setenv("WHISPER_STUB", "0")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-elevenlabs-key")
+
+    def fake_transcribe(path, **_kwargs):
+        assert Path(path).stat().st_size > 0
+        return "two fifty for the bus", "elevenlabs"
+
+    monkeypatch.setattr("main.transcribe_audio", fake_transcribe)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/log-expense",
+            data={"source": "voice", "text": "should not be used"},
+            files={"file": ("expense.m4a", b"fake-m4a-bytes", "audio/mp4")},
+        )
+        assert posted.status_code == 200
+        payload = posted.json()
+        assert payload["parse"]["textEngine"] == "elevenlabs"
+        assert payload["expense"]["originalText"] == "two fifty for the bus"
+        assert payload["expense"]["amountCents"] == 250
+        assert payload["expense"]["category"] == "Transport"
 
 
 def test_log_expense_receipt_text_still_uses_parser() -> None:

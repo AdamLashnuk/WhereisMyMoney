@@ -34,7 +34,7 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `TWILIO_AUTH_TOKEN` | no | Twilio token |
 | `TWILIO_PHONE_NUMBER` | no | From-number for outbound calls |
 | `MY_PHONE_NUMBER` | no | Default destination if settings are empty |
-| `WHISPER_STUB` | no | `1` forces stub audio→text (`spent fourteen bucks on lunch`) |
+| `WHISPER_STUB` | no | `1` forces stub audio→text (`spent fourteen bucks on lunch`). **Live voice STT requires `WHISPER_STUB=0` (or unset) and `ELEVENLABS_API_KEY`.** |
 | `ELEVENLABS_API_KEY` | no | Scribe STT (when `WHISPER_STUB` is unset/`0`) **and** Victoria TTS for outbound Twilio calls (`ai/elevenlabs_tts.py`, voice id `XoUkt2bf6DlvSzRmvA8X`) |
 | `ELEVENLABS_STT_MODEL` | no | Scribe model id (default `scribe_v2`) |
 | `PUBLIC_BASE_URL` | no | Public HTTPS origin of this backend (ngrok). Required for Twilio to `<Play>` ElevenLabs μ-law. Example: `https://xxxx.ngrok-free.app` (no trailing slash). Alias: `CALL_AUDIO_BASE_URL`. Localhost will not work. |
@@ -93,13 +93,13 @@ Outbound calls that play **ElevenLabs Victoria** need ngrok (or another public H
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/health` | `{ status: "ok", mode: "live", whisperStub, twilioConfigured, nemotronConfigured }` |
+| `GET` | `/health` | `{ status, whisperStub, twilioConfigured, nemotronConfigured, receiptOcrEnabled, capabilities: { receiptOCR, voiceStt, nemotron } }`. `receiptOcrEnabled` / `capabilities.receiptOCR` are true when `NVIDIA_API_KEY` is set. |
 | `POST` | `/log-expense` | `multipart/form-data`: `source=voice\|receipt`, optional `file`, optional `text`. Receipt images → Nemotron vision (`parse.engine=nemotron-vision`, `textEngine=receipt`) |
 | `POST` | `/parse-limit` | JSON `{ text }` → `{ category, amount_cents, period, confidence, readyToSave }`. Does **not** save. If `readyToSave`, the app should `POST /limits` |
 | `GET`/`POST` | `/limits` | `POST` body `{ category, limitCents }` (unchanged) |
 | `GET`/`POST` | `/settings` | `POST` body `{ callDay, callHour, phoneNumber }` |
 | `GET` | `/expenses` | Current week only |
-| `POST` | `/trigger-call` | `{ kind, category? }` |
+| `POST` | `/trigger-call` | `{ kind, category?, phoneNumber? }`. Optional `phoneNumber` is a one-time E.164-ish override (min 8 digits). If omitted, dials saved settings / `MY_PHONE_NUMBER`. |
 | `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` for Twilio (needs a cached μ-law file) |
 | `GET` | `/call-audio/{token}.ulaw` | Cached ElevenLabs 8 kHz μ-law (`audio/x-mulaw`) Twilio fetches after `<Play>` |
 
@@ -127,12 +127,20 @@ curl -s -X POST http://127.0.0.1:8000/parse-limit \
   -d '{"text":"cap my food spending at a hundred a week"}'
 ```
 
-Voice file (multipart field `file`). With `WHISPER_STUB=0` and `ELEVENLABS_API_KEY` set, this hits ElevenLabs Scribe:
+Voice file (multipart field `file`). **Live STT requires `WHISPER_STUB=0` and `ELEVENLABS_API_KEY`.** Expo sends `expense.m4a` (`audio/mp4`); a real m4a/mp3 is needed for Scribe. Response `parse.textEngine` is `elevenlabs` and `parse.engine` is `nemotron` when those keys are set. Transcribed text is stored on `expense.originalText`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/log-expense \
   -F source=voice \
-  -F file=@sample.mp3
+  -F file=@sample.m4a
+```
+
+Developer-tools one-time dial override (does not persist settings):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/trigger-call \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"weekly_summary","phoneNumber":"+14155550123"}'
 ```
 
 ## Nemotron (Person C)

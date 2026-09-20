@@ -7,6 +7,7 @@ Tries a real transcriber when ``WHISPER_STUB`` is not ``1``:
 
 Falls back to a deterministic stub so the server never crashes without a model.
 Set ``WHISPER_STUB=1`` to force the stub (recommended for laptop demos).
+Live ElevenLabs Scribe requires ``WHISPER_STUB=0`` (or unset) and ``ELEVENLABS_API_KEY``.
 """
 
 from __future__ import annotations
@@ -23,16 +24,55 @@ STUB_RECEIPT_TEXT = "RECEIPT TOTAL 14.00 LUNCH"
 
 ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 DEFAULT_ELEVENLABS_MODEL = "scribe_v2"
+_AUDIO_MIME = {
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".aac": "audio/aac",
+    ".mp3": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".webm": "audio/webm",
+    ".flac": "audio/flac",
+    ".caf": "audio/x-caf",
+}
 
 
 def whisper_stub_enabled() -> bool:
     return os.getenv("WHISPER_STUB", "").strip() in {"1", "true", "True", "yes", "YES"}
 
 
-def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, str]:
+def _audio_mime(path: Path, content_type: str = "") -> str:
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype == "video/mp4":
+        return "audio/mp4"
+    if ctype.startswith("audio/"):
+        return ctype
+    guessed = mimetypes.guess_type(path.name)[0]
+    if guessed:
+        return guessed
+    return _AUDIO_MIME.get(path.suffix.lower(), "application/octet-stream")
+
+
+def _upload_name(path: Path, filename: str = "") -> str:
+    raw = (filename or "").strip() or path.name
+    name = Path(raw).name or path.name
+    if Path(name).suffix:
+        return name
+    return path.name or "expense.m4a"
+
+
+def transcribe_audio(
+    path: str | Path,
+    *,
+    source: str = "voice",
+    content_type: str = "",
+    filename: str = "",
+) -> tuple[str, str]:
     """Return ``(text, engine)``: ``elevenlabs``, ``openai``, ``local``, or ``stub``.
 
     Never raises on missing models or keys — returns the stub instead.
+    Live STT requires ``WHISPER_STUB=0`` (or unset) and ``ELEVENLABS_API_KEY``.
     """
     fallback = STUB_VOICE_TEXT if source == "voice" else STUB_RECEIPT_TEXT
     if whisper_stub_enabled():
@@ -44,7 +84,7 @@ def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, s
         logger.warning("No audio bytes at %s; using stub", audio_path)
         return fallback, "stub"
 
-    text = _try_elevenlabs(audio_path)
+    text = _try_elevenlabs(audio_path, content_type=content_type, filename=filename)
     if text:
         return text, "elevenlabs"
 
@@ -60,7 +100,7 @@ def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, s
     return fallback, "stub"
 
 
-def _try_elevenlabs(path: Path) -> str | None:
+def _try_elevenlabs(path: Path, *, content_type: str = "", filename: str = "") -> str | None:
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     if not api_key:
         return None
@@ -70,14 +110,15 @@ def _try_elevenlabs(path: Path) -> str | None:
         logger.info("httpx package not installed; skip ElevenLabs STT")
         return None
     model_id = os.getenv("ELEVENLABS_STT_MODEL", "").strip() or DEFAULT_ELEVENLABS_MODEL
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    mime = _audio_mime(path, content_type)
+    upload_name = _upload_name(path, filename)
     try:
         with path.open("rb") as handle:
             response = httpx.post(
                 ELEVENLABS_STT_URL,
                 headers={"xi-api-key": api_key},
                 data={"model_id": model_id, "language_code": "eng"},
-                files={"file": (path.name, handle, mime)},
+                files={"file": (upload_name, handle, mime)},
                 timeout=60.0,
             )
         response.raise_for_status()
