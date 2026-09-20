@@ -10,7 +10,14 @@ async function request(path, options = {}) {
     }
     return data;
   } catch (error) {
-    if (error instanceof TypeError || error.message === 'Network request failed') {
+    if (
+      error instanceof TypeError
+      || error.message === 'Network request failed'
+      || /Unsupported FormDataPart/i.test(String(error?.message || error))
+    ) {
+      if (/Unsupported FormDataPart/i.test(String(error?.message || error))) {
+        throw new Error('Could not upload that file from Expo. Reload the app and try again.');
+      }
       throw new Error('Cannot reach the backend. Check that your iPhone and Sebastian’s server are on the same Wi-Fi.');
     }
     throw error;
@@ -23,6 +30,25 @@ function postJSON(path, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+/** Expo global fetch rejects RN {uri,name,type} FormData parts — convert to Blob/File. */
+async function appendLocalFile(form, field, uri, name, mime) {
+  const response = await fetch(uri);
+  if (!response.ok) {
+    throw new Error('Could not read the local file for upload.');
+  }
+  const blob = await response.blob();
+  const type = mime || blob.type || 'application/octet-stream';
+  try {
+    if (typeof File !== 'undefined') {
+      form.append(field, new File([blob], name, { type }));
+      return;
+    }
+  } catch (_) {
+    // fall through to blob + filename
+  }
+  form.append(field, blob, name);
 }
 
 export const getExpenses = () => request('/expenses');
@@ -62,13 +88,13 @@ function voiceMime(name) {
   return 'audio/mp4';
 }
 
-export function logVoiceExpense(uri) {
+export async function logVoiceExpense(uri) {
   if (!uri) throw new Error('Recording was empty. Please try again.');
   const name = voiceFilename(uri);
   const form = new FormData();
   form.append('source', 'voice');
-  form.append('file', { uri, name, type: voiceMime(name) });
-  // React Native supplies the multipart boundary. Do not set Content-Type.
+  await appendLocalFile(form, 'file', uri, name, voiceMime(name));
+  // Do not set Content-Type — fetch must set the multipart boundary.
   return request('/log-expense', { method: 'POST', body: form });
 }
 
@@ -80,14 +106,12 @@ export function logReceiptText(text) {
   return request('/log-expense', { method: 'POST', body: form });
 }
 
-export function logReceiptPhoto(photo) {
+export async function logReceiptPhoto(photo) {
   if (!photo?.uri) throw new Error('Take a receipt photo first.');
+  const name = photo.fileName || 'receipt.jpg';
+  const mime = photo.mimeType || 'image/jpeg';
   const form = new FormData();
   form.append('source', 'receipt');
-  form.append('file', {
-    uri: photo.uri,
-    name: photo.fileName || 'receipt.jpg',
-    type: photo.mimeType || 'image/jpeg',
-  });
+  await appendLocalFile(form, 'file', photo.uri, name, mime);
   return request('/log-expense', { method: 'POST', body: form });
 }
