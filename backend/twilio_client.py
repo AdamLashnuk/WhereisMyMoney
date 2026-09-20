@@ -5,15 +5,12 @@ Missing credentials must never crash the process: ``place_call`` returns
 
 When ElevenLabs TTS succeeds and ``PUBLIC_BASE_URL`` (or ``CALL_AUDIO_BASE_URL``)
 is a public HTTPS origin, the call ``url=`` points at our first-party TwiML
-``/twiml/play/{token}`` which ``<Play>``s ``/call-audio/{token}.ulaw``, then
-``<Gather input="speech dtmf">`` so the callee can talk back. Twilio posts
-``SpeechResult`` to ``/twiml/gather``. After each bot reply we Gather again
-until the callee hangs up.
+``/twiml/play/{token}`` which ``<Play>``s ``/call-audio/{token}.ulaw`` then
+``<Hangup/>``.
 
-If Gather TwiML cannot be built, we serve play-only (alert/summary still
-plays). If ``PUBLIC_BASE_URL`` is missing or TTS fails, we fall back to a
-Twimlets message URL (trial-safe ``<Say>``, one-way). Trial accounts often
-reject inline ``twiml=`` on Calls.create.
+If ``PUBLIC_BASE_URL`` is missing or TTS fails, we fall back to a Twimlets
+message URL (trial-safe ``<Say>``, one-way). Trial accounts often reject
+inline ``twiml=`` on Calls.create.
 """
 
 from __future__ import annotations
@@ -36,10 +33,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
-
-GATHER_TIMEOUT_SECONDS = 8
-GATHER_PROMPT = "You can reply now."
-GATHER_HINTS = "spent,lunch,food,limit,thanks,okay,dollars,budget"
 
 CALL_AUDIO_EXTENSION = ".ulaw"
 CALL_AUDIO_MEDIA_TYPE = "audio/x-mulaw"
@@ -115,13 +108,6 @@ def twiml_play_url(token: str, *, base: str | None = None) -> str | None:
     return f"{origin}/twiml/play/{token}"
 
 
-def twiml_gather_url(*, base: str | None = None) -> str | None:
-    origin = (base or public_base_url()).rstrip("/")
-    if not origin:
-        return None
-    return f"{origin}/twiml/gather"
-
-
 def call_audio_public_url(token: str, *, base: str | None = None) -> str | None:
     origin = (base or public_base_url()).rstrip("/")
     if not origin:
@@ -136,64 +122,16 @@ def _xml_response(*verbs: str) -> str:
     )
 
 
-def _say_verb(text: str) -> str:
-    spoken = rewrite_money_for_speech((text or "").strip())
-    if not spoken:
-        return ""
-    return f"<Say>{xml_escape(spoken)}</Say>"
-
-
 def _play_verb(url: str) -> str:
     return f"<Play>{xml_escape(url)}</Play>"
 
 
-def _gather_verb(*, action: str, inner: str = "") -> str:
-    return (
-        f'<Gather input="speech dtmf" timeout="{GATHER_TIMEOUT_SECONDS}" '
-        'speechTimeout="auto" actionOnEmptyResult="true" method="POST" '
-        f'language="en-US" hints="{xml_escape(GATHER_HINTS)}" '
-        f'action="{xml_escape(action)}">'
-        f"{inner}"
-        "</Gather>"
-    )
-
-
-def _gather_action(base: str | None) -> str:
-    """Absolute gather URL when we have an origin, else a relative path Twilio can resolve."""
-    return twiml_gather_url(base=base) or "/twiml/gather"
-
-
-def _gather_followup_verbs(*, base: str | None, inner: str | None = None) -> list[str]:
-    action = _gather_action(base)
-    prompt = inner if inner is not None else _say_verb(GATHER_PROMPT)
-    return [
-        _gather_verb(action=action, inner=prompt),
-        f"<Redirect>{xml_escape(action)}</Redirect>",
-    ]
-
-
-def render_play_twiml(
-    token: str,
-    *,
-    base: str | None = None,
-    include_gather: bool = True,
-) -> str | None:
-    """Alert/summary ``<Play>``, then speech ``<Gather>`` when a public origin exists.
-
-    If Gather setup fails, returns play-only TwiML so the outbound message still
-    plays (one-way). Missing ``PUBLIC_BASE_URL`` already keeps ``place_call`` on
-    Twimlets; this is the extra safety net when Twilio is fetching our TwiML.
-    """
+def render_play_twiml(token: str, *, base: str | None = None) -> str | None:
+    """One-way TwiML: ``<Play>`` the cached μ-law clip, then ``<Hangup/>``."""
     audio_url = call_audio_public_url(token, base=base)
     if not audio_url:
         return None
-    verbs = [_play_verb(audio_url)]
-    if include_gather:
-        try:
-            verbs.extend(_gather_followup_verbs(base=base))
-        except Exception:
-            logger.warning("Gather TwiML setup failed; serving play-only", exc_info=True)
-    return _xml_response(*verbs)
+    return _xml_response(_play_verb(audio_url), "<Hangup/>")
 
 
 def cache_call_audio(sentence: str) -> str | None:
@@ -212,39 +150,6 @@ def cache_call_audio(sentence: str) -> str | None:
             return audio_token
         logger.warning("ElevenLabs reported success but audio file is missing")
     return None
-
-
-def render_spoken_twiml(
-    spoken_text: str,
-    *,
-    base: str | None = None,
-    gather_again: bool = True,
-) -> str:
-    """Reply TwiML: ElevenLabs ``<Play>`` when possible, else ``<Say>``.
-
-    Always follows the reply with ``<Gather>`` so the callee can talk again
-    until they hang up. Empty ``spoken_text`` is a silent re-listen (timeout).
-
-    All money in ``spoken_text`` is rewritten to spoken USD before TTS/Say.
-    """
-    spoken = rewrite_money_for_speech((spoken_text or "").strip())[:900]
-    origin = (base or public_base_url()).rstrip("/")
-    lead = ""
-    if spoken:
-        token = cache_call_audio(spoken)
-        play_url = call_audio_public_url(token, base=origin or None) if token else None
-        lead = _play_verb(play_url) if play_url else _say_verb(spoken)
-
-    if gather_again:
-        try:
-            follow = _gather_followup_verbs(base=origin or None, inner="")
-            if follow:
-                return _xml_response(*(v for v in (lead, *follow) if v))
-        except Exception:
-            logger.warning("Gather loop TwiML setup failed; playing reply only", exc_info=True)
-    if lead:
-        return _xml_response(lead)
-    return _xml_response(_say_verb(GATHER_PROMPT))
 
 
 def twimlets_say_url(spoken_text: str) -> str:

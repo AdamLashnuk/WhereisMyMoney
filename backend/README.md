@@ -37,7 +37,7 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `WHISPER_STUB` | no | `1` forces stub audio→text (`spent fourteen bucks on lunch`). **Live voice STT requires `WHISPER_STUB=0` (or unset) and `ELEVENLABS_API_KEY`.** |
 | `ELEVENLABS_API_KEY` | no | Scribe STT (when `WHISPER_STUB` is unset/`0`) **and** Victoria TTS for outbound Twilio calls (`ai/elevenlabs_tts.py`, voice id `XoUkt2bf6DlvSzRmvA8X`) |
 | `ELEVENLABS_STT_MODEL` | no | Scribe model id (default `scribe_v2`) |
-| `PUBLIC_BASE_URL` | no | Public HTTPS origin of this backend (ngrok). **Required for Twilio to `<Play>` ElevenLabs μ-law and to POST speech to `/twiml/gather`.** Example: `https://xxxx.ngrok-free.app` (no trailing slash). Alias: `CALL_AUDIO_BASE_URL`. Localhost will not work. If unset, outbound calls stay one-way Twimlets `<Say>`. |
+| `PUBLIC_BASE_URL` | no | Public HTTPS origin of this backend (ngrok). Required for Twilio to `<Play>` ElevenLabs μ-law. Example: `https://xxxx.ngrok-free.app` (no trailing slash). Alias: `CALL_AUDIO_BASE_URL`. Localhost will not work. If unset, outbound calls stay one-way Twimlets `<Say>`. |
 | `CALL_AUDIO_BASE_URL` | no | Alias for `PUBLIC_BASE_URL` |
 | `CALL_AUDIO_DIR` | no | Directory for cached call μ-law files (default `backend/call_audio/`). Files are gitignored. |
 | `OPENAI_API_KEY` | no | Used after ElevenLabs when `openai` is installed |
@@ -65,9 +65,8 @@ curl -s -X POST http://127.0.0.1:8000/trigger-call \
 ```
 
 6. Confirm the JSON `call` object has `"voice": "elevenlabs"` and a `twimlUrl` under your ngrok origin (`/twiml/play/{token}`), not `twimlets.com`.
-7. Twilio fetches that TwiML, `<Play>`s `/call-audio/{token}.ulaw` (Victoria, `eleven_multilingual_v2`, `ulaw_8000`), then `<Gather input="speech dtmf">` with action `/twiml/gather`. Trial Twilio Gather works; only verified numbers can be dialed.
-8. After the alert, say **okay**, **I spent twenty dollars on lunch**, or **set food limit to fifty**. The bot replies, then listens again. Keep talking (log another expense, change a limit, or just say okay) until **you** hang up — the bot does not end the call. Reply audio uses the same Victoria μ-law path (or `<Say>` if TTS fails). Spoken money is USD English, never `$` / CHF / raw cents.
-9. If ElevenLabs fails **or** `PUBLIC_BASE_URL` is unset, `place_call` falls back to the trial-safe Twimlets `message` URL (Twilio `<Say>`, play-only — no Gather). If Gather TwiML cannot be built, `/twiml/play/{token}` still plays the alert.
+7. Twilio fetches that TwiML, `<Play>`s `/call-audio/{token}.ulaw` (Victoria, `eleven_multilingual_v2`, `ulaw_8000`), then **hangs up**. Weekly summary speech lists this week's expenses in spoken USD (top 6 by amount if there are more, plus "and X more").
+8. If ElevenLabs fails **or** `PUBLIC_BASE_URL` is unset, `place_call` falls back to the trial-safe Twimlets `message` URL (Twilio `<Say>`).
 
 ## ngrok (phone app + Twilio)
 
@@ -79,7 +78,7 @@ ngrok http 8000
 
 Give Person A the `https://…ngrok-free.app` origin for `app/config.js` (`API_BASE_URL`). Do **not** put Twilio/NVIDIA keys in the phone app.
 
-Outbound calls that play **ElevenLabs Victoria** and then listen for a spoken reply need ngrok (or another public HTTPS tunnel). Twilio cannot fetch `localhost`. Set `PUBLIC_BASE_URL` to the ngrok HTTPS origin so `place_call` can pass `url=` to `GET/POST /twiml/play/{token}` and so Twilio can POST `SpeechResult` to `/twiml/gather`. Without that origin (or if TTS fails), calls fall back to Twimlets `<Say>` (one-way) and ngrok is not required.
+Outbound calls that play **ElevenLabs Victoria** need ngrok (or another public HTTPS tunnel). Twilio cannot fetch `localhost`. Set `PUBLIC_BASE_URL` to the ngrok HTTPS origin so `place_call` can pass `url=` to `GET/POST /twiml/play/{token}`. Without that origin (or if TTS fails), calls fall back to Twimlets `<Say>` and ngrok is not required.
 
 ## Contract
 
@@ -100,9 +99,8 @@ Outbound calls that play **ElevenLabs Victoria** and then listen for a spoken re
 | `GET`/`POST` | `/limits` | `POST` body `{ category, limitCents }` (unchanged) |
 | `GET`/`POST` | `/settings` | `POST` body `{ callDay, callHour, phoneNumber }` |
 | `GET` | `/expenses` | Current week only |
-| `POST` | `/trigger-call` | `{ kind, category?, phoneNumber? }`. Optional `phoneNumber` is a one-time E.164-ish override (min 8 digits). If omitted, dials saved settings / `MY_PHONE_NUMBER`. |
-| `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` the alert, then `<Gather>` speech (needs a cached μ-law file). Play-only if Gather setup fails. |
-| `GET`/`POST` | `/twiml/gather` | Twilio Gather webhook. Form fields `SpeechResult` + optional `Confidence`. Speaks a reply (ElevenLabs `<Play>` or `<Say>`), then Gathers again until the callee hangs up. |
+| `POST` | `/trigger-call` | `{ kind, category?, phoneNumber? }`. Optional `phoneNumber` is a one-time E.164-ish override (min 8 digits). If omitted, dials saved settings / `MY_PHONE_NUMBER`. Weekly summary speech lists this week's expenses (merchant + spoken USD). More than 6 expenses → top 6 by amount plus "and X more". |
+| `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` the cached μ-law file, then `<Hangup/>` |
 | `GET` | `/call-audio/{token}.ulaw` | Cached ElevenLabs 8 kHz μ-law (`audio/x-mulaw`) Twilio fetches after `<Play>` |
 
 Example without an audio file:
@@ -155,7 +153,7 @@ curl -s -X POST http://127.0.0.1:8000/trigger-call \
 4. If Nemotron returns `amount_cents: null` (it understood the text but not the money), `/log-expense` returns **HTTP 400** and does **not** insert a guessed amount. Cents stay integers.
 5. Receipt **images** (`source=receipt` + image `file`) call `ai.receipt.categorize_receipt` (vision model `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`). `parse.engine` is `nemotron-vision` and `textEngine` is `receipt`. Images do **not** fall back to the text heuristic — null cents → HTTP 400 + `needs_review`.
 6. `POST /parse-limit` calls `ai.spoken_limit.understand_spoken_limit` and returns Person C's dict. It does not write limits. When `readyToSave` is true, the app should `POST /limits` with `{ category, limitCents }`.
-7. Over-limit Twilio speech uses `ai.overlimit_alert.overlimit_alert_sentence`; weekly summary appends `ai.weekly_pattern.weekly_pattern_sentence`. Both keep the existing template if Nemotron fails.
+7. Over-limit Twilio speech uses `ai.overlimit_alert.overlimit_alert_sentence`. Weekly summary lists this week's expenses in spoken USD (`backend/weekly_summary.py`, cap 6 + "and X more"); it appends `ai.weekly_pattern.weekly_pattern_sentence` only when there is no expense list. Both keep the existing template if Nemotron fails.
 
 Until a key is set, a keyword/amount heuristic handles phrases like:
 

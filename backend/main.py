@@ -43,7 +43,6 @@ from db import (
     week_total_for_category,
     week_totals,
 )
-from call_intents import ERROR_SPEECH, handle_spoken_reply, parse_limit_text
 from twilio_client import (
     CALL_AUDIO_MEDIA_TYPE,
     call_audio_filename,
@@ -52,9 +51,9 @@ from twilio_client import (
     place_call,
     public_base_url,
     render_play_twiml,
-    render_spoken_twiml,
     twilio_configured,
 )
+from weekly_summary import expenses_spent_sentence
 from whisper_client import transcribe_audio, whisper_stub_enabled
 
 _BACKEND_DIR = Path(__file__).resolve().parent
@@ -158,25 +157,24 @@ def weekly_summary_speech(
     totals: dict[str, int],
     week_total: int,
     last_week_totals: dict[str, int] | None = None,
+    expenses: list[dict[str, Any]] | None = None,
 ) -> str:
-    # Phone audio degrades on long scripts — speak a short intro + the top
-    # category only. Person C's weekly_pattern_sentence is appended, then
-    # currency symbols/codes are normalized to spoken USD.
-    if week_total == 0:
-        parts = [
-            "This is Where Is My Money with your weekly summary.",
-            "No expenses logged this week.",
-        ]
+    """Spoken weekly call script. Lists this week's expenses when provided."""
+    intro = "This is Where Is My Money with your weekly summary."
+    spent_list = expenses_spent_sentence(expenses)
+    if spent_list:
+        base = rewrite_money_for_speech(f"{intro} {spent_list}")
+    elif week_total == 0:
+        base = f"{intro} No expenses logged this week."
     else:
-        parts = [
-            "This is Where Is My Money with your weekly summary.",
-            f"You spent {cents_to_speech(week_total)} this week.",
-        ]
+        parts = [intro, f"You spent {cents_to_speech(week_total)} this week."]
         top_category = max(CATEGORIES, key=lambda category: totals.get(category, 0))
         if totals.get(top_category, 0):
             parts.append(f"Mostly on {top_category}.")
-    base = " ".join(parts)
-    if not _nemotron_configured():
+        base = " ".join(parts)
+
+    # Expense list is the demo script. Skip Nemotron so the call stays short.
+    if spent_list or not _nemotron_configured():
         return base
     try:
         from ai.weekly_pattern import weekly_pattern_sentence
@@ -240,7 +238,8 @@ def place_weekly_summary_call(*, force: bool = False, phone_number: str | None =
     totals = week_totals(week_start=week_start)
     week_total = sum(totals.values())
     last_week_totals = week_totals(week_start=week_start - timedelta(days=7))
-    spoken = weekly_summary_speech(totals, week_total, last_week_totals)
+    expenses = list_expenses(week_start=week_start)
+    spoken = weekly_summary_speech(totals, week_total, last_week_totals, expenses=expenses)
 
     if not force and has_successful_call("weekly_summary", None, week_start):
         return {
@@ -403,47 +402,8 @@ def _play_twiml_response(token: str, request: Request) -> Response:
 
 @app.api_route("/twiml/play/{token}", methods=["GET", "POST"])
 def twiml_play(token: str, request: Request) -> Response:
-    """First-party TwiML for Twilio: <Play> the alert, then <Gather> speech."""
+    """First-party TwiML for Twilio: <Play> the alert, then hang up."""
     return _play_twiml_response(token, request)
-
-
-def _optional_confidence(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number != number:
-        return None
-    return number
-
-
-async def _speech_from_request(request: Request) -> tuple[str, float | None]:
-    speech = str(request.query_params.get("SpeechResult") or "").strip()
-    confidence = _optional_confidence(request.query_params.get("Confidence"))
-    if request.method == "POST":
-        form = await request.form()
-        speech = str(form.get("SpeechResult") or speech).strip()
-        if confidence is None:
-            confidence = _optional_confidence(form.get("Confidence"))
-    return speech, confidence
-
-
-@app.api_route("/twiml/gather", methods=["GET", "POST"])
-async def twiml_gather(request: Request) -> Response:
-    """Twilio Gather webhook: SpeechResult → spoken reply, then listen again."""
-    base = public_base_url() or str(request.base_url).rstrip("/")
-    try:
-        speech, confidence = await _speech_from_request(request)
-        logger.info("Gather SpeechResult=%r Confidence=%s", speech, confidence)
-        outcome = handle_spoken_reply(speech, speech_confidence=confidence)
-        xml = render_spoken_twiml(outcome.spoken, base=base, gather_again=True)
-        return Response(content=xml, media_type="application/xml")
-    except Exception:
-        logger.exception("Gather webhook failed")
-        xml = render_spoken_twiml(ERROR_SPEECH, base=base, gather_again=True)
-        return Response(content=xml, media_type="application/xml")
 
 
 @app.get("/call-audio/{token}.ulaw")
@@ -654,6 +614,73 @@ async def log_expense(
     except Exception as exc:
         logger.exception("log-expense failed")
         raise HTTPException(status_code=500, detail=f"Could not log expense: {exc}") from exc
+
+
+PARSE_LIMIT_SAVE_CONFIDENCE = 0.6
+
+
+def parse_limit_text(text: str) -> dict[str, Any]:
+    """Same result as ``POST /parse-limit``. Does not persist."""
+    from ai.spoken_limit import understand_spoken_limit
+
+    try:
+        parsed = understand_spoken_limit(text)
+    except Exception:
+        logger.exception("spoken limit parse failed")
+        parsed = {
+            "category": None,
+            "amount_cents": None,
+            "period": "weekly",
+            "confidence": 0.0,
+        }
+
+    if not isinstance(parsed, dict):
+        parsed = {
+            "category": None,
+            "amount_cents": None,
+            "period": "weekly",
+            "confidence": 0.0,
+        }
+
+    category = parsed.get("category")
+    if category not in CATEGORIES:
+        category = None
+
+    amount_cents = parsed.get("amount_cents")
+    if isinstance(amount_cents, bool) or amount_cents is None:
+        amount_cents = None
+    elif isinstance(amount_cents, int):
+        amount_cents = amount_cents if amount_cents >= 0 else None
+    elif isinstance(amount_cents, float) and abs(amount_cents - round(amount_cents)) <= 1e-6:
+        coerced = int(round(amount_cents))
+        amount_cents = coerced if coerced >= 0 else None
+    else:
+        amount_cents = None
+
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence != confidence:
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    ready = (
+        category is not None
+        and amount_cents is not None
+        and confidence >= PARSE_LIMIT_SAVE_CONFIDENCE
+    )
+    return {
+        "category": category,
+        "amount_cents": amount_cents,
+        "period": "weekly",
+        "confidence": confidence,
+        "readyToSave": ready,
+        "saveHint": (
+            "POST /limits with {category, limitCents: amount_cents} when readyToSave is true. "
+            "This endpoint does not persist."
+        ),
+    }
 
 
 @app.post("/parse-limit")
