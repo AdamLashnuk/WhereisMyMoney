@@ -4,7 +4,7 @@ Money is always whole cents (integers). Exactly six categories: Food, Transport,
 
 ## Endpoints
 
-- `POST /log-expense` — voice or receipt → expense + limit check. Receipt **images** use `ai.receipt.categorize_receipt` (Nemotron vision); null `amount_cents` is HTTP 400 (no invented cents).
+- `POST /log-expense` — voice or receipt → expense(s) + limit check. Voice transcripts may contain **multiple** spends in one take; the backend splits into N ≥ 1 ledger rows. Response always includes the first row as `expense` (backward compatible) plus `expenses` (all rows) and `results` (`{ expense, limitCheck }` per row). Receipt **images** use `ai.receipt.categorize_receipt` (Nemotron vision); null `amount_cents` is HTTP 400 (no invented cents). Empty/garbage voice text is HTTP 400.
 - `POST /parse-limit` — JSON `{ "text": "..." }` → `{ category, amount_cents, period: "weekly", confidence }`. Does **not** save. If confidence is high and both fields are present, the app should then `POST /limits`.
 - `POST /limits` / `GET /limits` — `POST` body remains `{ category, limitCents }`
 - `POST /settings` / `GET /settings`

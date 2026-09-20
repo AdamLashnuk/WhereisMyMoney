@@ -119,7 +119,8 @@ const res = await fetch(`${API_BASE_URL}/log-expense`, {
   body: form,
 });
 const data = await res.json();
-// data.expense, data.limitCheck
+// data.expense (first row, always present on success), data.expenses (all rows),
+// data.limitCheck (one representative over-limit check for the batch)
 ```
 
 ## 4. Rules (don’t break these)

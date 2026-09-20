@@ -42,7 +42,7 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `CALL_AUDIO_DIR` | no | Directory for cached call μ-law files (default `backend/call_audio/`). Files are gitignored. |
 | `OPENAI_API_KEY` | no | Used after ElevenLabs when `openai` is installed |
 | `WHISPER_MODEL` | no | Local openai-whisper model name (default `base`) |
-| `NVIDIA_API_KEY` | no | When set, `parse_expense` calls `ai.categorize.categorize_expense` (NVIDIA Nemotron) and receipt **images** call `ai.receipt.categorize_receipt` (vision). Missing/failed text → heuristic parser. Images never invent cents (HTTP 400 if `amount_cents` is null). Also used for `/parse-limit`, over-limit, and weekly-summary phrasing. |
+| `NVIDIA_API_KEY` | no | When set, voice `/log-expense` calls `ai.categorize.categorize_expenses` (list extract) and `parse_expense` still calls `categorize_expense`. Receipt **images** call `ai.receipt.categorize_receipt` (vision). Missing/failed text → heuristic parser (including `and`/comma/money splits). Images never invent cents (HTTP 400 if `amount_cents` is null). Also used for `/parse-limit`, over-limit, and weekly-summary phrasing. |
 | `TZ` | no | Timezone for the weekly call hour (default `America/New_York`) |
 | `WHEREISMYMONEY_DB` | no | Alternate SQLite path |
 
@@ -94,7 +94,7 @@ Outbound calls that play **ElevenLabs Victoria** need ngrok (or another public H
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/health` | `{ status, whisperStub, twilioConfigured, nemotronConfigured, receiptOcrEnabled, capabilities: { receiptOCR, voiceStt, nemotron } }`. `receiptOcrEnabled` / `capabilities.receiptOCR` are true when `NVIDIA_API_KEY` is set. |
-| `POST` | `/log-expense` | `multipart/form-data`: `source=voice\|receipt`, optional `file`, optional `text`. Receipt images → Nemotron vision (`parse.engine=nemotron-vision`, `textEngine=receipt`) |
+| `POST` | `/log-expense` | `multipart/form-data`: `source=voice\|receipt`, optional `file`, optional `text`. Voice transcripts may list **multiple** spends in one recording; each becomes a ledger row. Response: `expense` (first, backward compatible), `expenses` (all), `results`, `limitCheck` / `limitChecks`. Receipt images → Nemotron vision (`parse.engine=nemotron-vision`, `textEngine=receipt`) |
 | `POST` | `/parse-limit` | JSON `{ text }` → `{ category, amount_cents, period, confidence, readyToSave }`. Does **not** save. If `readyToSave`, the app should `POST /limits` |
 | `GET`/`POST` | `/limits` | `POST` body `{ category, limitCents }` (unchanged) |
 | `GET`/`POST` | `/settings` | `POST` body `{ callDay, callHour, phoneNumber }` |
@@ -127,12 +127,20 @@ curl -s -X POST http://127.0.0.1:8000/parse-limit \
   -d '{"text":"cap my food spending at a hundred a week"}'
 ```
 
-Voice file (multipart field `file`). **Live STT requires `WHISPER_STUB=0` and `ELEVENLABS_API_KEY`.** Expo sends `expense.m4a` (`audio/mp4`); a real m4a/mp3 is needed for Scribe. Response `parse.textEngine` is `elevenlabs` and `parse.engine` is `nemotron` when those keys are set. Transcribed text is stored on `expense.originalText`.
+Voice file (multipart field `file`). **Live STT requires `WHISPER_STUB=0` and `ELEVENLABS_API_KEY`.** Expo sends `expense.m4a` (`audio/mp4`); a real m4a/mp3 is needed for Scribe. Response `parse.textEngine` is `elevenlabs` and `parse.engine` is `nemotron` when those keys are set. After STT, the transcript is split into **N ≥ 1** expenses (Nemotron list extract when `NVIDIA_API_KEY` is set; otherwise a heuristic on `and` / commas / repeated money). Each item is stored as its own row; `expense.originalText` / each `expenses[]` entry keeps that item's fragment. `expense` is the first row so older clients keep working; History should use `GET /expenses` (or iterate `expenses`) to show every new row.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/log-expense \
   -F source=voice \
   -F file=@sample.m4a
+```
+
+Spoken list (no audio) — two Food rows from one request:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/log-expense \
+  -F source=voice \
+  -F 'text=twelve dollars on drinks and five hundred on groceries'
 ```
 
 Developer-tools one-time dial override (does not persist settings):
@@ -145,18 +153,20 @@ curl -s -X POST http://127.0.0.1:8000/trigger-call \
 
 ## Nemotron (Person C)
 
-`categorizer.parse_expense(text) -> ParsedExpense` is the **only** parse interface `main.py` uses.
+`categorizer.parse_expenses(text) -> list[ParsedExpense]` is what voice `/log-expense` uses after STT. `parse_expense(text)` remains the single-item helper (receipt text, one fragment).
 
 1. Keep the `ParsedExpense` fields (`original_text`, `merchant`, `amount_cents`, `category`, `confidence`, `needs_review`).
-2. When `NVIDIA_API_KEY` is set, the parser calls `ai.categorize.categorize_expense` (Person C's prompt is unchanged) and maps the dict onto `ParsedExpense`.
-3. If Nemotron is down or the key is missing, the keyword heuristic still handles demo phrases.
-4. If Nemotron returns `amount_cents: null` (it understood the text but not the money), `/log-expense` returns **HTTP 400** and does **not** insert a guessed amount. Cents stay integers.
+2. When `NVIDIA_API_KEY` is set, voice parsing calls `ai.categorize.categorize_expenses` (list of `{amount_cents, category, merchant, original fragment}`). Single-item `parse_expense` still calls `ai.categorize.categorize_expense`.
+3. If Nemotron is down or the key is missing, a keyword heuristic splits on `and` / commas / repeated money patterns so the demo works offline (`twelve dollars on drinks and five hundred on groceries` → two Food rows).
+4. If nothing with a positive amount can be parsed (empty/garbage, or Nemotron `amount_cents: null` with no heuristic fallback hit), `/log-expense` returns **HTTP 400** and does **not** insert a guessed amount. Cents stay integers.
 5. Receipt **images** (`source=receipt` + image `file`) call `ai.receipt.categorize_receipt` (vision model `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`). `parse.engine` is `nemotron-vision` and `textEngine` is `receipt`. Images do **not** fall back to the text heuristic — null cents → HTTP 400 + `needs_review`.
 6. `POST /parse-limit` calls `ai.spoken_limit.understand_spoken_limit` and returns Person C's dict. It does not write limits. When `readyToSave` is true, the app should `POST /limits` with `{ category, limitCents }`.
 7. Over-limit Twilio speech uses `ai.overlimit_alert.overlimit_alert_sentence`. Weekly summary lists this week's expenses in spoken USD (`backend/weekly_summary.py`, cap 6 + "and X more"); it appends `ai.weekly_pattern.weekly_pattern_sentence` only when there is no expense list. Both keep the existing template if Nemotron fails.
+8. **Multi-item limit checks:** all items from one utterance are inserted first, then `_maybe_over_limit_call` runs **once per distinct category** in that batch (not once per item). Same-category lines share one check / at most one Twilio attempt; existing once-per-week-per-category still applies. `limitCheck` is the most relevant of those (a placed/failed/already call if any). `limitChecks` lists every category checked.
 
 Until a key is set, a keyword/amount heuristic handles phrases like:
 
 - `spent fourteen bucks on lunch` → $14.00 Food
 - `two fifty for the bus` → $2.50 Transport
 - `thirty two forty five on groceries` → $32.45 Food
+- `twelve dollars on drinks and five hundred on groceries` → $12.00 Food **and** $500.00 Food (two rows)
