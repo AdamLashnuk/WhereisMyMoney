@@ -1,11 +1,14 @@
+from ai.money_speech import cents_to_speech, rewrite_money_for_speech
 from ai.nemotron import ask_nemotron_json
 
 SYSTEM_PROMPT = """You write a short spoken alert for a budgeting app. The user just went \
 over a spending limit they set themselves, and the app is calling them right now to tell \
 them. You write what the voice says on that call.
 
-You will be given the category, the limit in dollars, and how far over in dollars — \
-already calculated. Do not do any math yourself. Just phrase these exact numbers naturally.
+You will be given the category, the limit, and how far over — already written as spoken \
+US dollars and cents. Do not do any math yourself. Phrase those exact spoken amounts \
+naturally. Never say francs, CHF, euros, or read a currency code. Never use $ or other \
+currency symbols.
 
 Respond with ONLY a JSON object, no markdown fences, no commentary:
 
@@ -18,17 +21,12 @@ Rules:
 - The very first thing said must make clear this is an over-limit alert call, not the \
 weekly summary — someone answering the phone needs to immediately know which kind of call \
 this is, from the first few words.
-- Use the exact dollar figures you were given. Do not recalculate or round them.
+- Use the exact spoken US dollar amounts you were given. Do not recalculate or round them.
 - Calm and factual, not alarming, not scolding, not apologetic. The tone is a friendly \
 heads-up, not a warning siren. This app doesn't guilt-trip people.
 - Do not think out loud, do not explain your reasoning, do not show your work. Output the \
 JSON object and nothing else, immediately.
 """
-
-
-def _format_dollars(cents):
-    """Convert cents to a clean dollar string, e.g. 150 -> '$1.50', 5 -> '$0.05'."""
-    return f"${cents / 100:.2f}"
 
 
 def overlimit_alert_sentence(category, limit_cents, over_by_cents):
@@ -41,8 +39,8 @@ def overlimit_alert_sentence(category, limit_cents, over_by_cents):
     numbers we've already computed correctly. Falls back to a safe, correct sentence
     if Nemotron fails.
     """
-    limit_str = _format_dollars(limit_cents)
-    over_str = _format_dollars(over_by_cents)
+    limit_str = cents_to_speech(limit_cents)
+    over_str = cents_to_speech(over_by_cents)
 
     user_message = (
         f"Category: {category}\n"
@@ -62,4 +60,4 @@ def overlimit_alert_sentence(category, limit_cents, over_by_cents):
             f"limit by {over_str}."
         )
 
-    return result["sentence"]
+    return rewrite_money_for_speech(result["sentence"])

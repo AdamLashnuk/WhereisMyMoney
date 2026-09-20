@@ -11,6 +11,8 @@ native phone audio instead of re-encoding a default MP3 down to 8 kHz.
 from dotenv import load_dotenv
 import os
 
+from ai.money_speech import rewrite_money_for_speech
+
 load_dotenv()
 
 VOICE_ID = "XoUkt2bf6DlvSzRmvA8X"  # Victoria
@@ -40,6 +42,7 @@ def text_to_speech(sentence, output_path):
     Turns a sentence into a telephony μ-law file at output_path
     (e.g. "demo/weekly_call.ulaw"). Returns True on success, False on failure.
     """
+    sentence = rewrite_money_for_speech(sentence)
     api_key = elevenlabs_api_key()
     if not api_key:
         print("[elevenlabs] ELEVENLABS_API_KEY is not set; skipping TTS")
