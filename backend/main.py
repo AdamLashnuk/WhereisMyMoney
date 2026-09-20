@@ -160,14 +160,13 @@ def weekly_summary_speech(
     expenses: list[dict[str, Any]] | None = None,
 ) -> str:
     """Spoken weekly call script. Lists this week's expenses when provided."""
-    intro = "This is Where Is My Money with your weekly summary."
     spent_list = expenses_spent_sentence(expenses)
     if spent_list:
-        base = rewrite_money_for_speech(f"{intro} {spent_list}")
+        base = rewrite_money_for_speech(spent_list)
     elif week_total == 0:
-        base = f"{intro} No expenses logged this week."
+        base = "No expenses logged this week."
     else:
-        parts = [intro, f"You spent {cents_to_speech(week_total)} this week."]
+        parts = [f"You spent {cents_to_speech(week_total)} this week."]
         top_category = max(CATEGORIES, key=lambda category: totals.get(category, 0))
         if totals.get(top_category, 0):
             parts.append(f"Mostly on {top_category}.")

@@ -1157,11 +1157,11 @@ def test_weekly_summary_lists_sample_expenses_in_spoken_usd() -> None:
         "Other": 50000,
     }
     spoken = weekly_summary_speech(totals, 51400, expenses=expenses)
-    assert spoken.startswith("This is Where Is My Money with your weekly summary.")
-    assert "Spent one dollar on Celcius" in spoken
-    assert "thirteen dollars on Walmart" in spoken
-    assert "five hundred dollars on aws credits" in spoken.lower()
-    assert "one dollar" in spoken
+    assert spoken == (
+        "Spent one dollar on Celcius, thirteen dollars on Walmart, "
+        "and five hundred dollars on AWS Credits."
+    )
+    assert "Where Is My Money" not in spoken
     assert "$" not in spoken
     assert "CHF" not in spoken
 
