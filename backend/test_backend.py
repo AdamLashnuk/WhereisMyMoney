@@ -33,10 +33,17 @@ from db import (  # noqa: E402
     sunday_week_start,
 )
 from main import app, over_limit_speech, weekly_summary_speech  # noqa: E402
+from call_intents import (  # noqa: E402
+    classify_spoken_reply,
+    heuristic_spoken_limit,
+    looks_like_ack,
+    looks_like_limit,
+)
 from twilio_client import (  # noqa: E402
     call_audio_dir,
     call_audio_path,
     place_call,
+    render_play_twiml,
     twimlets_say_url,
 )
 from whisper_client import (  # noqa: E402
@@ -699,11 +706,18 @@ def test_place_call_plays_elevenlabs_audio_via_twiml_url(monkeypatch, tmp_path) 
         assert "<Play>" in body
         assert f"https://demo.ngrok-free.app/call-audio/{token}.ulaw" in body
         assert ".mp3" not in body
-        assert "<Say>" not in body
+        assert body.index("<Play>") < body.index("<Gather")
+        assert 'input="speech dtmf"' in body
+        assert 'timeout="6"' in body
+        assert "actionOnEmptyResult" in body
+        assert "https://demo.ngrok-free.app/twiml/gather" in body
+        assert "You can reply now" in body
+        assert "<Hangup/>" in body
 
         posted = client.post(f"/twiml/play/{token}")
         assert posted.status_code == 200
         assert f"/call-audio/{token}.ulaw" in posted.text
+        assert "<Gather" in posted.text
 
         ulaw = client.get(f"/call-audio/{token}.ulaw")
         assert ulaw.status_code == 200
@@ -1113,3 +1127,275 @@ def test_parse_limit_rejects_empty_text() -> None:
         saved = client.post("/limits", json={"category": "Transport", "limitCents": 2500})
         assert saved.status_code == 200
         assert saved.json()["limits"]["Transport"] == 2500
+
+
+def _fake_call_audio(captured: list[str]):
+    def fake_success(sentence, output_path):
+        captured.append(sentence)
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x00\x01ulaw")
+        return {"success": True, "audio_path": output_path}
+
+    return fake_success
+
+
+def test_classify_spoken_reply_intents() -> None:
+    assert classify_spoken_reply("").name == "empty"
+    assert classify_spoken_reply("   ").name == "empty"
+    assert looks_like_ack("okay thanks")
+    assert classify_spoken_reply("okay").name == "ack"
+    assert classify_spoken_reply("Thanks!").name == "ack"
+    assert classify_spoken_reply("got it").name == "ack"
+
+    expense = classify_spoken_reply("I spent twenty dollars on lunch")
+    assert expense.name == "log_expense"
+    assert expense.amount_cents == 2000
+    assert expense.category == "Food"
+
+    assert looks_like_limit("set food limit to fifty")
+    limit = classify_spoken_reply("set food limit to fifty")
+    assert limit.name == "set_limit"
+    assert limit.category == "Food"
+    assert limit.amount_cents == 5000
+
+    cap = heuristic_spoken_limit("cap my food spending at a hundred a week")
+    assert cap is not None
+    assert cap["category"] == "Food"
+    assert cap["amount_cents"] == 10000
+    assert classify_spoken_reply("cap my food spending at a hundred a week").name == "set_limit"
+
+    assert classify_spoken_reply("what's the weather").name == "unknown"
+    assert classify_spoken_reply("set food limit to fifty").name != "log_expense"
+
+
+def test_render_play_twiml_play_only_when_gather_setup_fails(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CALL_AUDIO_DIR", str(tmp_path / "call_audio"))
+    token = "ab" * 16
+    audio = call_audio_path(token)
+    assert audio is not None
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    audio.write_bytes(b"\x00\x01ulaw")
+
+    xml = render_play_twiml(token, base="https://demo.ngrok-free.app", include_gather=False)
+    assert xml is not None
+    assert "<Play>" in xml
+    assert "<Gather" not in xml
+
+    def boom(**_kwargs):
+        raise RuntimeError("no gather url")
+
+    monkeypatch.setattr("twilio_client.twiml_gather_url", boom)
+    xml = render_play_twiml(token, base="https://demo.ngrok-free.app")
+    assert xml is not None
+    assert f"https://demo.ngrok-free.app/call-audio/{token}.ulaw" in xml
+    assert "<Gather" not in xml
+
+
+def test_gather_ack_returns_hangup_twiml(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    spoken: list[str] = []
+    monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "okay thanks", "Confidence": "0.91"},
+        )
+        assert posted.status_code == 200
+        assert "xml" in (posted.headers.get("content-type") or "")
+        body = posted.text
+        assert "<Response>" in body
+        assert "<Play>" in body
+        assert "<Hangup/>" in body
+        assert "<Gather" not in body
+        assert spoken
+        assert "Got it" in spoken[0]
+        assert "$" not in spoken[0]
+
+
+def test_gather_logs_expense_from_speech(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    spoken: list[str] = []
+    monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "I spent twenty dollars on lunch", "Confidence": "0.88"},
+        )
+        assert posted.status_code == 200
+        body = posted.text
+        assert "<Play>" in body
+        assert "<Hangup/>" in body
+        history = client.get("/expenses").json()
+        assert history["weekTotalCents"] == 2000
+        assert history["expenses"][0]["category"] == "Food"
+        assert history["expenses"][0]["amountCents"] == 2000
+        assert history["expenses"][0]["source"] == "voice"
+        assert history["expenses"][0]["originalText"] == "I spent twenty dollars on lunch"
+        assert spoken
+        assert "twenty dollars" in spoken[0]
+        assert "Food" in spoken[0]
+        assert "$" not in spoken[0]
+        assert "CHF" not in spoken[0]
+        assert "2000" not in spoken[0]
+
+
+def test_gather_expense_mentions_over_limit_in_spoken_usd(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    spoken: list[str] = []
+    monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
+    _fresh_db()
+    with TestClient(app) as client:
+        client.post("/limits", json={"category": "Food", "limitCents": 1000})
+        posted = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "I spent twenty dollars on lunch"},
+        )
+        assert posted.status_code == 200
+        assert spoken
+        assert "twenty dollars" in spoken[0]
+        assert "ten dollars" in spoken[0]
+        assert "$" not in spoken[0]
+        assert "CHF" not in spoken[0]
+
+
+def test_gather_sets_limit_from_speech_heuristic(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    spoken: list[str] = []
+    monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
+    _fresh_db()
+    with TestClient(app) as client:
+        assert client.get("/limits").json()["limits"]["Food"] == 5000
+        posted = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "set food limit to thirty"},
+        )
+        assert posted.status_code == 200
+        assert client.get("/limits").json()["limits"]["Food"] == 3000
+        assert spoken
+        assert "thirty dollars" in spoken[0]
+        assert "Food" in spoken[0]
+        assert "$" not in spoken[0]
+        assert "3000" not in spoken[0]
+
+
+def test_gather_sets_limit_from_spoken_limit_parser(monkeypatch, tmp_path) -> None:
+    def fake_limit(raw_text: str) -> dict:
+        assert "hundred" in raw_text
+        return {
+            "category": "Food",
+            "amount_cents": 10000,
+            "period": "weekly",
+            "confidence": 0.93,
+        }
+
+    monkeypatch.setattr("ai.spoken_limit.understand_spoken_limit", fake_limit)
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    spoken: list[str] = []
+    monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "cap my food spending at a hundred a week"},
+        )
+        assert posted.status_code == 200
+        assert client.get("/limits").json()["limits"]["Food"] == 10000
+        assert spoken
+        assert "one hundred dollars" in spoken[0]
+        assert "$" not in spoken[0]
+
+
+def test_gather_empty_retries_then_goodbye(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    spoken: list[str] = []
+    monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
+    _fresh_db()
+    with TestClient(app) as client:
+        first = client.post("/twiml/gather", data={"SpeechResult": ""})
+        assert first.status_code == 200
+        assert "<Gather" in first.text
+        assert 'timeout="6"' in first.text
+        assert "attempt=1" in first.text
+        assert "<Hangup/>" in first.text
+
+        second = client.post("/twiml/gather?attempt=1", data={"SpeechResult": ""})
+        assert second.status_code == 200
+        assert "<Gather" not in second.text
+        assert "<Hangup/>" in second.text
+        assert any("didn't hear" in line or "Goodbye" in line for line in spoken)
+
+
+def test_gather_unknown_retries_once(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+    spoken: list[str] = []
+    monkeypatch.setattr("twilio_client.get_call_audio", _fake_call_audio(spoken))
+    _fresh_db()
+    with TestClient(app) as client:
+        first = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "what is the weather in Pittsburgh"},
+        )
+        assert first.status_code == 200
+        assert "<Gather" in first.text
+        assert "attempt=1" in first.text
+        assert spoken
+        assert "didn't catch" in spoken[0]
+
+        second = client.post(
+            "/twiml/gather?attempt=1",
+            data={"SpeechResult": "still nonsense"},
+        )
+        assert second.status_code == 200
+        assert "<Gather" not in second.text
+        assert "<Hangup/>" in second.text
+
+
+def test_gather_falls_back_to_say_when_tts_fails(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+
+    def fake_failure(sentence, output_path):
+        return {"success": False, "fallback_text": sentence}
+
+    monkeypatch.setattr("twilio_client.get_call_audio", fake_failure)
+    _fresh_db()
+    with TestClient(app) as client:
+        posted = client.post(
+            "/twiml/gather",
+            data={"SpeechResult": "I spent twenty dollars on lunch"},
+        )
+        assert posted.status_code == 200
+        body = posted.text
+        assert "<Say>" in body
+        assert "twenty dollars" in body
+        assert "$" not in body
+        assert "CHF" not in body
+        assert "2000" not in body
+        assert client.get("/expenses").json()["weekTotalCents"] == 2000
+
+
+def test_gather_say_fallback_rewrites_raw_money(monkeypatch, tmp_path) -> None:
+    _twilio_env(monkeypatch, tmp_path, PUBLIC_BASE_URL="https://demo.ngrok-free.app")
+
+    def fake_failure(sentence, output_path):
+        return {"success": False, "fallback_text": sentence}
+
+    monkeypatch.setattr("twilio_client.get_call_audio", fake_failure)
+    monkeypatch.setattr(
+        "main.handle_spoken_reply",
+        lambda *_args, **_kwargs: type(
+            "Outcome",
+            (),
+            {"spoken": "You are over by $20.00 after CHF 54.50", "gather_again": False, "intent": "ack"},
+        )(),
+    )
+    with TestClient(app) as client:
+        posted = client.post("/twiml/gather", data={"SpeechResult": "okay"})
+        assert posted.status_code == 200
+        body = posted.text
+        assert "twenty dollars" in body
+        assert "fifty-four dollars and fifty cents" in body
+        assert "$" not in body
+        assert "CHF" not in body

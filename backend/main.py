@@ -43,6 +43,7 @@ from db import (
     week_total_for_category,
     week_totals,
 )
+from call_intents import ERROR_SPEECH, handle_spoken_reply, parse_limit_text
 from twilio_client import (
     CALL_AUDIO_MEDIA_TYPE,
     call_audio_filename,
@@ -51,6 +52,7 @@ from twilio_client import (
     place_call,
     public_base_url,
     render_play_twiml,
+    render_spoken_twiml,
     twilio_configured,
 )
 from whisper_client import transcribe_audio, whisper_stub_enabled
@@ -71,7 +73,6 @@ Category = Literal["Food", "Transport", "Subscriptions", "Shopping", "Bills", "O
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".mpeg", ".mp4", ".flac", ".caf"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".bmp"}
-PARSE_LIMIT_SAVE_CONFIDENCE = 0.6
 _E164ISH = re.compile(r"^\+[1-9]\d{7,14}$")
 _CONTENT_TYPE_AUDIO_SUFFIX = {
     "audio/mp4": ".m4a",
@@ -402,8 +403,70 @@ def _play_twiml_response(token: str, request: Request) -> Response:
 
 @app.api_route("/twiml/play/{token}", methods=["GET", "POST"])
 def twiml_play(token: str, request: Request) -> Response:
-    """First-party TwiML for Twilio: <Play> the cached ElevenLabs μ-law audio."""
+    """First-party TwiML for Twilio: <Play> the alert, then <Gather> speech."""
     return _play_twiml_response(token, request)
+
+
+def _parse_gather_attempt(request: Request) -> int:
+    raw = request.query_params.get("attempt")
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _optional_confidence(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return number
+
+
+async def _speech_from_request(request: Request) -> tuple[str, float | None]:
+    speech = str(request.query_params.get("SpeechResult") or "").strip()
+    confidence = _optional_confidence(request.query_params.get("Confidence"))
+    if request.method == "POST":
+        form = await request.form()
+        speech = str(form.get("SpeechResult") or speech).strip()
+        if confidence is None:
+            confidence = _optional_confidence(form.get("Confidence"))
+    return speech, confidence
+
+
+@app.api_route("/twiml/gather", methods=["GET", "POST"])
+async def twiml_gather(request: Request) -> Response:
+    """Twilio Gather webhook: SpeechResult → spoken reply TwiML (Play or Say)."""
+    base = public_base_url() or str(request.base_url).rstrip("/")
+    try:
+        attempt = _parse_gather_attempt(request)
+        speech, confidence = await _speech_from_request(request)
+        logger.info(
+            "Gather SpeechResult=%r Confidence=%s attempt=%s",
+            speech,
+            confidence,
+            attempt,
+        )
+        outcome = handle_spoken_reply(
+            speech,
+            attempt=attempt,
+            speech_confidence=confidence,
+        )
+        xml = render_spoken_twiml(
+            outcome.spoken,
+            base=base,
+            gather_again=outcome.gather_again,
+            attempt=attempt,
+        )
+        return Response(content=xml, media_type="application/xml")
+    except Exception:
+        logger.exception("Gather webhook failed")
+        xml = render_spoken_twiml(ERROR_SPEECH, base=base, gather_again=False)
+        return Response(content=xml, media_type="application/xml")
 
 
 @app.get("/call-audio/{token}.ulaw")
@@ -619,66 +682,7 @@ async def log_expense(
 @app.post("/parse-limit")
 def parse_limit(body: ParseLimitBody) -> dict[str, Any]:
     """Parse spoken limit text. Does not save. High-confidence results can POST /limits."""
-    from ai.spoken_limit import understand_spoken_limit
-
-    try:
-        parsed = understand_spoken_limit(body.text)
-    except Exception:
-        logger.exception("spoken limit parse failed")
-        parsed = {
-            "category": None,
-            "amount_cents": None,
-            "period": "weekly",
-            "confidence": 0.0,
-        }
-
-    if not isinstance(parsed, dict):
-        parsed = {
-            "category": None,
-            "amount_cents": None,
-            "period": "weekly",
-            "confidence": 0.0,
-        }
-
-    category = parsed.get("category")
-    if category not in CATEGORIES:
-        category = None
-
-    amount_cents = parsed.get("amount_cents")
-    if isinstance(amount_cents, bool) or amount_cents is None:
-        amount_cents = None
-    elif isinstance(amount_cents, int):
-        amount_cents = amount_cents if amount_cents >= 0 else None
-    elif isinstance(amount_cents, float) and abs(amount_cents - round(amount_cents)) <= 1e-6:
-        coerced = int(round(amount_cents))
-        amount_cents = coerced if coerced >= 0 else None
-    else:
-        amount_cents = None
-
-    try:
-        confidence = float(parsed.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    if confidence != confidence:
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, confidence))
-
-    ready = (
-        category is not None
-        and amount_cents is not None
-        and confidence >= PARSE_LIMIT_SAVE_CONFIDENCE
-    )
-    return {
-        "category": category,
-        "amount_cents": amount_cents,
-        "period": "weekly",
-        "confidence": confidence,
-        "readyToSave": ready,
-        "saveHint": (
-            "POST /limits with {category, limitCents: amount_cents} when readyToSave is true. "
-            "This endpoint does not persist."
-        ),
-    }
+    return parse_limit_text(body.text)
 
 
 @app.post("/limits")

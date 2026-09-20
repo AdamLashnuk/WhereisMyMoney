@@ -37,7 +37,7 @@ Copy the repo-root `.env.example`. Relevant keys:
 | `WHISPER_STUB` | no | `1` forces stub audio→text (`spent fourteen bucks on lunch`). **Live voice STT requires `WHISPER_STUB=0` (or unset) and `ELEVENLABS_API_KEY`.** |
 | `ELEVENLABS_API_KEY` | no | Scribe STT (when `WHISPER_STUB` is unset/`0`) **and** Victoria TTS for outbound Twilio calls (`ai/elevenlabs_tts.py`, voice id `XoUkt2bf6DlvSzRmvA8X`) |
 | `ELEVENLABS_STT_MODEL` | no | Scribe model id (default `scribe_v2`) |
-| `PUBLIC_BASE_URL` | no | Public HTTPS origin of this backend (ngrok). Required for Twilio to `<Play>` ElevenLabs μ-law. Example: `https://xxxx.ngrok-free.app` (no trailing slash). Alias: `CALL_AUDIO_BASE_URL`. Localhost will not work. |
+| `PUBLIC_BASE_URL` | no | Public HTTPS origin of this backend (ngrok). **Required for Twilio to `<Play>` ElevenLabs μ-law and to POST speech to `/twiml/gather`.** Example: `https://xxxx.ngrok-free.app` (no trailing slash). Alias: `CALL_AUDIO_BASE_URL`. Localhost will not work. If unset, outbound calls stay one-way Twimlets `<Say>`. |
 | `CALL_AUDIO_BASE_URL` | no | Alias for `PUBLIC_BASE_URL` |
 | `CALL_AUDIO_DIR` | no | Directory for cached call μ-law files (default `backend/call_audio/`). Files are gitignored. |
 | `OPENAI_API_KEY` | no | Used after ElevenLabs when `openai` is installed |
@@ -65,8 +65,9 @@ curl -s -X POST http://127.0.0.1:8000/trigger-call \
 ```
 
 6. Confirm the JSON `call` object has `"voice": "elevenlabs"` and a `twimlUrl` under your ngrok origin (`/twiml/play/{token}`), not `twimlets.com`.
-7. Twilio fetches that TwiML, then `<Play>`s `/call-audio/{token}.ulaw` — Victoria (`eleven_multilingual_v2`, `output_format=ulaw_8000`, `Content-Type: audio/x-mulaw`). Phone audio should be 8 kHz μ-law, not a transcoded MP3.
-8. If ElevenLabs fails **or** `PUBLIC_BASE_URL` is unset, `place_call` falls back to the trial-safe Twimlets `message` URL (Twilio `<Say>`).
+7. Twilio fetches that TwiML, `<Play>`s `/call-audio/{token}.ulaw` (Victoria, `eleven_multilingual_v2`, `ulaw_8000`), then `<Gather input="speech dtmf">` with action `/twiml/gather`. Trial Twilio Gather works; only verified numbers can be dialed.
+8. After the alert, say **okay**, **I spent twenty dollars on lunch**, or **set food limit to fifty**. Reply audio uses the same Victoria μ-law path (or `<Say>` if TTS fails). Spoken money is USD English, never `$` / CHF / raw cents.
+9. If ElevenLabs fails **or** `PUBLIC_BASE_URL` is unset, `place_call` falls back to the trial-safe Twimlets `message` URL (Twilio `<Say>`, play-only — no Gather). If Gather TwiML cannot be built, `/twiml/play/{token}` still plays the alert.
 
 ## ngrok (phone app + Twilio)
 
@@ -78,7 +79,7 @@ ngrok http 8000
 
 Give Person A the `https://…ngrok-free.app` origin for `app/config.js` (`API_BASE_URL`). Do **not** put Twilio/NVIDIA keys in the phone app.
 
-Outbound calls that play **ElevenLabs Victoria** need ngrok (or another public HTTPS tunnel). Twilio cannot fetch `localhost`. Set `PUBLIC_BASE_URL` to the ngrok HTTPS origin so `place_call` can pass `url=` to `GET/POST /twiml/play/{token}`. Without that origin (or if TTS fails), calls fall back to Twimlets `<Say>` and ngrok is not required.
+Outbound calls that play **ElevenLabs Victoria** and then listen for a spoken reply need ngrok (or another public HTTPS tunnel). Twilio cannot fetch `localhost`. Set `PUBLIC_BASE_URL` to the ngrok HTTPS origin so `place_call` can pass `url=` to `GET/POST /twiml/play/{token}` and so Twilio can POST `SpeechResult` to `/twiml/gather`. Without that origin (or if TTS fails), calls fall back to Twimlets `<Say>` (one-way) and ngrok is not required.
 
 ## Contract
 
@@ -100,7 +101,8 @@ Outbound calls that play **ElevenLabs Victoria** need ngrok (or another public H
 | `GET`/`POST` | `/settings` | `POST` body `{ callDay, callHour, phoneNumber }` |
 | `GET` | `/expenses` | Current week only |
 | `POST` | `/trigger-call` | `{ kind, category?, phoneNumber? }`. Optional `phoneNumber` is a one-time E.164-ish override (min 8 digits). If omitted, dials saved settings / `MY_PHONE_NUMBER`. |
-| `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` for Twilio (needs a cached μ-law file) |
+| `GET`/`POST` | `/twiml/play/{token}` | TwiML `<Play>` the alert, then `<Gather>` speech (needs a cached μ-law file). Play-only if Gather setup fails. |
+| `GET`/`POST` | `/twiml/gather` | Twilio Gather webhook. Form fields `SpeechResult` + optional `Confidence`. Returns TwiML that speaks a reply (ElevenLabs `<Play>` or `<Say>`) and hangs up, or one re-Gather. |
 | `GET` | `/call-audio/{token}.ulaw` | Cached ElevenLabs 8 kHz μ-law (`audio/x-mulaw`) Twilio fetches after `<Play>` |
 
 Example without an audio file:
