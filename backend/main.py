@@ -62,6 +62,8 @@ if str(_REPO_ROOT) not in sys.path:
 load_dotenv(_BACKEND_DIR / ".env")
 load_dotenv(_BACKEND_DIR.parent / ".env")
 
+from ai.money_speech import cents_to_speech, rewrite_money_for_speech  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("whereismymoney")
 
@@ -87,14 +89,6 @@ _CONTENT_TYPE_AUDIO_SUFFIX = {
     "audio/x-caf": ".caf",
     "video/mp4": ".m4a",
 }
-
-
-def cents_to_speech(cents: int) -> str:
-    dollars, rem = divmod(abs(int(cents)), 100)
-    if rem == 0:
-        unit = "dollar" if dollars == 1 else "dollars"
-        return f"{dollars} {unit}"
-    return f"{dollars} dollars and {rem} cents"
 
 
 def _nemotron_configured() -> bool:
@@ -153,7 +147,7 @@ def over_limit_speech(category: str, week_total: int, limit: int, over_by: int) 
 
         spoken = overlimit_alert_sentence(category, limit, over_by)
         if spoken and str(spoken).strip():
-            return str(spoken).strip()
+            return rewrite_money_for_speech(str(spoken).strip())
     except Exception:
         logger.exception("Nemotron over-limit sentence failed; using template")
     return fallback
@@ -165,7 +159,8 @@ def weekly_summary_speech(
     last_week_totals: dict[str, int] | None = None,
 ) -> str:
     # Phone audio degrades on long scripts — speak a short intro + the top
-    # category only. Person C's weekly_pattern_sentence is appended unchanged.
+    # category only. Person C's weekly_pattern_sentence is appended, then
+    # currency symbols/codes are normalized to spoken USD.
     if week_total == 0:
         parts = [
             "This is Where Is My Money with your weekly summary.",
@@ -188,7 +183,7 @@ def weekly_summary_speech(
         previous = last_week_totals if last_week_totals is not None else {c: 0 for c in CATEGORIES}
         extra = weekly_pattern_sentence(totals, previous)
         if extra and str(extra).strip():
-            return f"{base} {str(extra).strip()}"
+            return rewrite_money_for_speech(f"{base} {str(extra).strip()}")
     except Exception:
         logger.exception("Nemotron weekly pattern failed; using template")
     return base

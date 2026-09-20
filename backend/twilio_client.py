@@ -45,6 +45,12 @@ except Exception:  # pragma: no cover - module always present after this PR
     def get_call_audio(sentence, output_path):  # type: ignore[misc]
         return {"success": False, "fallback_text": sentence}
 
+try:
+    from ai.money_speech import rewrite_money_for_speech
+except Exception:  # pragma: no cover
+    def rewrite_money_for_speech(text):  # type: ignore[misc]
+        return text
+
 
 def twilio_configured() -> bool:
     return bool(
@@ -120,7 +126,7 @@ def render_play_twiml(token: str, *, base: str | None = None) -> str | None:
 
 
 def twimlets_say_url(spoken_text: str) -> str:
-    message = (spoken_text or "Where Is My Money.").strip()[:900]
+    message = rewrite_money_for_speech((spoken_text or "Where Is My Money.").strip())[:900]
     return "https://twimlets.com/message?Message%5B0%5D=" + quote(message)
 
 
@@ -147,7 +153,7 @@ def place_call(to: str | None, spoken_text: str) -> dict[str, Any]:
         logger.warning("twilio package is not installed")
         return {"ok": False, "error": "twilio package is not installed"}
 
-    message = (spoken_text or "Where Is My Money.").strip()[:900]
+    message = rewrite_money_for_speech((spoken_text or "Where Is My Money.").strip())[:900]
     twiml_url, voice = _outbound_twiml_url(message)
 
     try:

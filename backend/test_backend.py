@@ -37,6 +37,7 @@ from twilio_client import (  # noqa: E402
     call_audio_dir,
     call_audio_path,
     place_call,
+    twimlets_say_url,
 )
 from whisper_client import (  # noqa: E402
     ELEVENLABS_STT_URL,
@@ -379,11 +380,58 @@ def test_log_expense_uses_nemotron_cents(monkeypatch) -> None:
         assert payload["expense"]["originalText"] == "uber downtown"
 
 
+def test_over_limit_speech_uses_spoken_usd_not_symbols_or_raw_cents() -> None:
+    os.environ.pop("NVIDIA_API_KEY", None)
+    spoken = over_limit_speech("Food", 18550, 5000, 13550)
+    assert spoken == (
+        "This is Where Is My Money. You went over your Food limit. "
+        "You are over by one hundred thirty-five dollars and fifty cents."
+    )
+    assert "$" not in spoken
+    assert "CHF" not in spoken
+    assert "franc" not in spoken.lower()
+    assert "13550" not in spoken
+    assert "185.50" not in spoken
+
+
+def test_weekly_summary_speech_uses_spoken_usd_for_large_total() -> None:
+    os.environ.pop("NVIDIA_API_KEY", None)
+    totals = {
+        "Food": 18550,
+        "Transport": 0,
+        "Subscriptions": 0,
+        "Shopping": 0,
+        "Bills": 0,
+        "Other": 0,
+    }
+    spoken = weekly_summary_speech(totals, 18550)
+    assert "one hundred eighty-five dollars and fifty cents" in spoken
+    assert "You spent one hundred eighty-five dollars and fifty cents this week." in spoken
+    assert "$" not in spoken
+    assert "CHF" not in spoken
+    assert "18550" not in spoken
+
+
+def test_over_limit_speech_rewrites_nemotron_currency_fragments(monkeypatch) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "ai.overlimit_alert.overlimit_alert_sentence",
+        lambda *_args, **_kwargs: "Alert: you are $185.50 over, same as CHF 185.50.",
+    )
+    spoken = over_limit_speech("Food", 23550, 5000, 18550)
+    assert "one hundred eighty-five dollars and fifty cents" in spoken
+    assert "$" not in spoken
+    assert "CHF" not in spoken
+    assert "185.50" not in spoken
+
+
 def test_over_limit_speech_uses_nemotron_and_falls_back(monkeypatch) -> None:
     os.environ.pop("NVIDIA_API_KEY", None)
     template = over_limit_speech("Food", 1400, 1000, 400)
     assert "Food" in template
     assert "over by" in template.lower()
+    assert "four dollars" in template
+    assert "4 dollars" not in template
     assert len(template.split()) <= 40
 
     monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
@@ -600,6 +648,13 @@ def test_elevenlabs_tts_posts_victoria_voice(monkeypatch, tmp_path) -> None:
     assert tts.AUDIO_EXTENSION == ".ulaw"
     assert tts.AUDIO_MEDIA_TYPE == "audio/x-mulaw"
 
+    assert tts.text_to_speech("Over by $185.50 after CHF 54.50", str(out)) is True
+    spoken_payload = captured["json"]["text"]
+    assert "one hundred eighty-five dollars and fifty cents" in spoken_payload
+    assert "fifty-four dollars and fifty cents" in spoken_payload
+    assert "$" not in spoken_payload
+    assert "CHF" not in spoken_payload
+
     result = tts.get_call_audio("again", str(tmp_path / "again.ulaw"))
     assert result["success"] is True
 
@@ -673,6 +728,27 @@ def test_place_call_falls_back_to_twimlets_when_elevenlabs_fails(monkeypatch, tm
     url = str(captured["url"])
     assert url.startswith("https://twimlets.com/message?")
     assert "fourteen" in url
+
+
+def test_twimlets_and_place_call_rewrite_chf_and_dollar_symbols(monkeypatch, tmp_path) -> None:
+    url = twimlets_say_url("Berghotel Grosse Scheidegg · CHF 54.50")
+    assert "fifty-four" in url
+    assert "dollars" in url
+    assert "CHF" not in url
+    assert "%24" not in url  # encoded $
+
+    _twilio_env(monkeypatch, tmp_path)
+    captured = _install_fake_twilio(monkeypatch)
+
+    def fake_failure(sentence, output_path):
+        return {"success": False, "fallback_text": sentence}
+
+    monkeypatch.setattr("twilio_client.get_call_audio", fake_failure)
+    result = place_call("+15555550100", "You are over by $185.50")
+    assert result["ok"] is True
+    assert "one%20hundred%20eighty-five" in str(captured["url"])
+    assert "CHF" not in str(captured["url"])
+    assert "$" not in str(captured["url"])
 
 
 def test_place_call_falls_back_to_twimlets_without_public_base_url(monkeypatch, tmp_path) -> None:
