@@ -4,8 +4,6 @@
 
 > Nobody’s problem is a lack of budgeting apps. The problem is nobody opens them. A phone call is hard to ignore.
 
-**Repo:** [github.com/AdamLashnuk/WhereisMyMoney](https://github.com/AdamLashnuk/WhereisMyMoney)
-
 ---
 
 ## What it does
