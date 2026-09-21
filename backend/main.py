@@ -1,7 +1,7 @@
 """Where Is My Money — FastAPI backend.
 
-Real SQLite + heuristic categorizer + optional Whisper/Twilio.
-Starts without Twilio keys. Person C is not required.
+Real SQLite + heuristic categorizer with optional NVIDIA Nemotron (Person C).
+Starts without Twilio or NVIDIA keys. Demo works offline.
 """
 
 from __future__ import annotations
@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from pathlib import Path
@@ -19,10 +22,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from categorizer import parse_expense
+from categorizer import UnknownAmountError, parse_expense, parse_expenses, parse_receipt_image
 from db import (
     CATEGORIES,
     USER_ID,
@@ -40,50 +43,148 @@ from db import (
     week_total_for_category,
     week_totals,
 )
-from twilio_client import place_call, twilio_configured
+from twilio_client import (
+    CALL_AUDIO_MEDIA_TYPE,
+    call_audio_filename,
+    call_audio_path,
+    is_call_audio_token,
+    place_call,
+    public_base_url,
+    render_play_twiml,
+    twilio_configured,
+)
+from weekly_summary import expenses_spent_sentence
 from whisper_client import transcribe_audio, whisper_stub_enabled
 
 _BACKEND_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _BACKEND_DIR.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 load_dotenv(_BACKEND_DIR / ".env")
 load_dotenv(_BACKEND_DIR.parent / ".env")
+
+from ai.money_speech import cents_to_speech, rewrite_money_for_speech  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("whereismymoney")
 
 Category = Literal["Food", "Transport", "Subscriptions", "Shopping", "Bills", "Other"]
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".mpeg", ".mp4", ".flac"}
+AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".mpeg", ".mp4", ".flac", ".caf"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".bmp"}
+_E164ISH = re.compile(r"^\+[1-9]\d{7,14}$")
+_CONTENT_TYPE_AUDIO_SUFFIX = {
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/webm": ".webm",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "audio/x-caf": ".caf",
+    "video/mp4": ".m4a",
+}
 
 
-def cents_to_speech(cents: int) -> str:
-    dollars, rem = divmod(abs(int(cents)), 100)
-    if rem == 0:
-        unit = "dollar" if dollars == 1 else "dollars"
-        return f"{dollars} {unit}"
-    return f"{dollars} dollars and {rem} cents"
+def _nemotron_configured() -> bool:
+    key = os.getenv("NVIDIA_API_KEY")
+    return bool(key and str(key).strip())
 
 
-def over_limit_speech(category: str, week_total: int, limit: int, over_by: int) -> str:
-    return (
-        f"This is Where Is My Money. You went over your {category} limit. "
-        f"You spent {cents_to_speech(week_total)}. "
-        f"Your limit is {cents_to_speech(limit)}. "
-        f"You are over by {cents_to_speech(over_by)}."
+def _elevenlabs_configured() -> bool:
+    return bool(os.getenv("ELEVENLABS_API_KEY", "").strip())
+
+
+def _voice_stt_available() -> bool:
+    """Live STT is advertised only when the stub is off and a key is present."""
+    if whisper_stub_enabled():
+        return False
+    return _elevenlabs_configured() or bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+
+def _normalize_trigger_phone(override: str | None) -> str | None:
+    """Validate an optional E.164-ish override. None/blank → use saved settings."""
+    if override is None:
+        return None
+    cleaned = str(override).strip()
+    if not cleaned:
+        return None
+    if _E164ISH.fullmatch(cleaned):
+        return cleaned
+    digits = re.sub(r"\D", "", cleaned)
+    if len(digits) >= 8:
+        return cleaned
+    raise HTTPException(
+        status_code=400,
+        detail="phoneNumber must be E.164 (e.g. +14155550123) or at least 8 digits",
     )
 
 
-def weekly_summary_speech(totals: dict[str, int], week_total: int) -> str:
-    parts = [
-        "This is Where Is My Money with your weekly summary.",
-        f"You spent {cents_to_speech(week_total)} this week.",
-    ]
-    for category in CATEGORIES:
-        amount = totals.get(category, 0)
-        if amount:
-            parts.append(f"{category}: {cents_to_speech(amount)}.")
-    if week_total == 0:
-        parts.append("No expenses logged this week.")
-    return " ".join(parts)
+def _call_destination(override: str | None) -> str | None:
+    """Dial override if provided, else saved settings (place_call falls back to MY_PHONE_NUMBER)."""
+    validated = _normalize_trigger_phone(override)
+    if validated:
+        return validated
+    return get_settings().get("phoneNumber")
+
+
+def over_limit_speech(category: str, week_total: int, limit: int, over_by: int) -> str:
+    # Keep the phone script short (~15 words). Callers still pass week_total
+    # for the function signature; Nemotron only needs category/limit/over_by.
+    fallback = (
+        f"This is Where Is My Money. You went over your {category} limit. "
+        f"You are over by {cents_to_speech(over_by)}."
+    )
+    if not _nemotron_configured():
+        return fallback
+    try:
+        from ai.overlimit_alert import overlimit_alert_sentence
+
+        spoken = overlimit_alert_sentence(category, limit, over_by)
+        if spoken and str(spoken).strip():
+            return rewrite_money_for_speech(str(spoken).strip())
+    except Exception:
+        logger.exception("Nemotron over-limit sentence failed; using template")
+    return fallback
+
+
+def weekly_summary_speech(
+    totals: dict[str, int],
+    week_total: int,
+    last_week_totals: dict[str, int] | None = None,
+    expenses: list[dict[str, Any]] | None = None,
+) -> str:
+    """Spoken weekly call script. Lists this week's expenses when provided."""
+    spent_list = expenses_spent_sentence(expenses)
+    if spent_list:
+        base = rewrite_money_for_speech(spent_list)
+    elif week_total == 0:
+        base = "No expenses logged this week."
+    else:
+        parts = [f"You spent {cents_to_speech(week_total)} this week."]
+        top_category = max(CATEGORIES, key=lambda category: totals.get(category, 0))
+        if totals.get(top_category, 0):
+            parts.append(f"Mostly on {top_category}.")
+        base = " ".join(parts)
+
+    # Expense list is the demo script. Skip Nemotron so the call stays short.
+    if spent_list or not _nemotron_configured():
+        return base
+    try:
+        from ai.weekly_pattern import weekly_pattern_sentence
+
+        previous = last_week_totals if last_week_totals is not None else {c: 0 for c in CATEGORIES}
+        extra = weekly_pattern_sentence(totals, previous)
+        if extra and str(extra).strip():
+            return rewrite_money_for_speech(f"{base} {str(extra).strip()}")
+    except Exception:
+        logger.exception("Nemotron weekly pattern failed; using template")
+    return base
 
 
 def _maybe_over_limit_call(category: str) -> dict[str, Any]:
@@ -131,11 +232,13 @@ def _maybe_over_limit_call(category: str) -> dict[str, Any]:
     return result
 
 
-def place_weekly_summary_call(*, force: bool = False) -> dict[str, Any]:
+def place_weekly_summary_call(*, force: bool = False, phone_number: str | None = None) -> dict[str, Any]:
     week_start = sunday_week_start()
     totals = week_totals(week_start=week_start)
     week_total = sum(totals.values())
-    spoken = weekly_summary_speech(totals, week_total)
+    last_week_totals = week_totals(week_start=week_start - timedelta(days=7))
+    expenses = list_expenses(week_start=week_start)
+    spoken = weekly_summary_speech(totals, week_total, last_week_totals, expenses=expenses)
 
     if not force and has_successful_call("weekly_summary", None, week_start):
         return {
@@ -148,8 +251,8 @@ def place_weekly_summary_call(*, force: bool = False) -> dict[str, Any]:
             "message": spoken,
         }
 
-    settings = get_settings()
-    call = place_call(settings.get("phoneNumber"), spoken)
+    dest = _call_destination(phone_number)
+    call = place_call(dest, spoken)
     logged = log_call(
         kind="weekly_summary",
         category=None,
@@ -214,7 +317,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="Where Is My Money",
     version="1.0.0",
-    description="SteelHacks backend — SQLite, heuristic categorizer, optional Whisper + Twilio.",
+    description="SteelHacks backend — SQLite, heuristic or Nemotron categorizer, optional Whisper + Twilio.",
     lifespan=lifespan,
 )
 
@@ -241,6 +344,11 @@ class SettingsBody(BaseModel):
 class TriggerCallBody(BaseModel):
     kind: Literal["over_limit", "weekly_summary"] = "weekly_summary"
     category: Category | None = None
+    phoneNumber: str | None = None
+
+
+class ParseLimitBody(BaseModel):
+    text: str = Field(..., min_length=1)
 
 
 @app.exception_handler(RequestValidationError)
@@ -261,18 +369,60 @@ async def unhandled_handler(_request: Request, exc: Exception) -> JSONResponse:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    nemotron = _nemotron_configured()
     return {
         "status": "ok",
         "mode": "live",
         "userId": USER_ID,
         "whisperStub": whisper_stub_enabled(),
         "twilioConfigured": twilio_configured(),
+        "nemotronConfigured": nemotron,
+        "receiptOcrEnabled": nemotron,
+        "capabilities": {
+            "receiptOCR": nemotron,
+            "voiceStt": _voice_stt_available(),
+            "nemotron": nemotron,
+        },
     }
 
 
-async def _read_upload(file: UploadFile | None) -> tuple[bytes, str]:
+def _play_twiml_response(token: str, request: Request) -> Response:
+    if not is_call_audio_token(token):
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    path = call_audio_path(token)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    base = public_base_url() or str(request.base_url).rstrip("/")
+    xml = render_play_twiml(token, base=base)
+    if not xml:
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    return Response(content=xml, media_type="application/xml")
+
+
+@app.api_route("/twiml/play/{token}", methods=["GET", "POST"])
+def twiml_play(token: str, request: Request) -> Response:
+    """First-party TwiML for Twilio: <Play> the alert, then hang up."""
+    return _play_twiml_response(token, request)
+
+
+@app.get("/call-audio/{token}.ulaw")
+def serve_call_audio(token: str) -> FileResponse:
+    """Public 8 kHz μ-law file Twilio fetches after our TwiML <Play>."""
+    if not is_call_audio_token(token):
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    path = call_audio_path(token)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Unknown call audio")
+    return FileResponse(
+        path,
+        media_type=CALL_AUDIO_MEDIA_TYPE,
+        filename=call_audio_filename(token),
+    )
+
+
+async def _read_upload(file: UploadFile | None) -> tuple[bytes, str, str]:
     if file is None:
-        return b"", ""
+        return b"", "", ""
     try:
         data = await file.read()
     except Exception as exc:
@@ -280,7 +430,26 @@ async def _read_upload(file: UploadFile | None) -> tuple[bytes, str]:
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Upload exceeds 20 MB")
     filename = file.filename or ""
-    return data, filename
+    content_type = file.content_type or ""
+    return data, filename, content_type
+
+
+def _looks_like_image(filename: str, data: bytes, content_type: str = "") -> bool:
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if suffix in IMAGE_SUFFIXES:
+        return True
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype.startswith("image/"):
+        return True
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return True
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return True
+    return False
 
 
 def _decode_text_bytes(data: bytes) -> str | None:
@@ -298,36 +467,148 @@ def _decode_text_bytes(data: bytes) -> str | None:
     return None
 
 
-def _original_text(*, source: str, text: str | None, upload: bytes, filename: str) -> tuple[str, str]:
+def _audio_suffix(filename: str, content_type: str = "") -> str:
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if suffix in AUDIO_SUFFIXES:
+        return suffix
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    return _CONTENT_TYPE_AUDIO_SUFFIX.get(ctype, ".m4a")
+
+
+def _transcribe_upload(upload: bytes, filename: str, content_type: str = "") -> tuple[str, str]:
+    suffix = _audio_suffix(filename, content_type)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(upload)
+        tmp_path = tmp.name
+    try:
+        return transcribe_audio(
+            tmp_path,
+            source="voice",
+            content_type=content_type,
+            filename=filename,
+        )
+    finally:
+        with suppress(OSError):
+            os.unlink(tmp_path)
+
+
+def _original_text(
+    *,
+    source: str,
+    text: str | None,
+    upload: bytes,
+    filename: str,
+    content_type: str = "",
+) -> tuple[str, str]:
     """Return (original_text, text_engine)."""
+    # Voice audio bytes always go through STT — do not prefer a leftover form field.
+    if source == "voice" and upload:
+        return _transcribe_upload(upload, filename, content_type)
+
     if text and text.strip():
         return text.strip(), "form"
 
     if source == "voice":
-        suffix = Path(filename).suffix.lower() if filename else ".wav"
-        if suffix not in AUDIO_SUFFIXES:
-            suffix = ".wav"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(upload)
-            tmp_path = tmp.name
-        try:
-            spoken, engine = transcribe_audio(tmp_path, source="voice")
-            return spoken, engine
-        finally:
-            with suppress(OSError):
-                os.unlink(tmp_path)
+        return _transcribe_upload(upload, filename, content_type)
 
     decoded = _decode_text_bytes(upload)
     if decoded:
         return decoded, "receipt-text"
 
-    # Receipt images have no OCR until Person C. Stub keeps /log-expense usable.
+    # Non-image receipt uploads: stub text keeps the demo usable without a photo.
+    # Image files never reach here — they go through categorize_receipt instead.
     if whisper_stub_enabled() or not upload:
         return "RECEIPT TOTAL 14.00 LUNCH", "stub"
     raise HTTPException(
         status_code=400,
-        detail="Could not extract text from receipt. Send a text file, a `text` form field, or wait for Person C OCR/Nemotron.",
+        detail="Could not extract text from receipt. Send an image file, a text file, or a `text` form field.",
     )
+
+
+def _pick_limit_check(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    """One representative check for backward-compatible ``limitCheck``.
+
+    Prefer a check that placed (or attempted) a call, then any over-limit
+    category, else the first category in the batch.
+    """
+    if not checks:
+        return {
+            "category": None,
+            "weekTotalCents": 0,
+            "limitCents": 0,
+            "overByCents": 0,
+            "action": "nothing",
+            "note": None,
+            "call": None,
+        }
+    for preferred in ("placed_call", "call_failed", "already_called"):
+        for check in checks:
+            if check.get("action") == preferred and int(check.get("overByCents") or 0) > 0:
+                return check
+    for check in checks:
+        if int(check.get("overByCents") or 0) > 0:
+            return check
+    return checks[0]
+
+
+def _expense_payload(parsed_items, source: str, text_engine: str, swap: str) -> dict[str, Any]:
+    """Persist each parsed item, then run at most one over-limit check per category.
+
+    Inserts happen first so week totals include the whole spoken list. Limit
+    checks then run once per distinct category in the batch — never N Twilio
+    attempts for N items in the same category. ``expense`` is the first row
+    (Expo currently reads that); ``expenses`` / ``results`` list every row.
+    """
+    if not isinstance(parsed_items, (list, tuple)):
+        parsed_items = [parsed_items]
+    if not parsed_items:
+        raise UnknownAmountError(
+            "Could not determine an amount in cents from the text. "
+            "Please include a dollar amount and try again."
+        )
+
+    expenses: list[dict[str, Any]] = []
+    for parsed in parsed_items:
+        expenses.append(
+            insert_expense(
+                original_text=parsed.original_text,
+                source=source,
+                merchant=parsed.merchant,
+                amount_cents=int(parsed.amount_cents),
+                category=parsed.category,
+                confidence=parsed.confidence,
+                needs_review=parsed.needs_review,
+            )
+        )
+
+    ordered_categories: list[str] = []
+    for parsed in parsed_items:
+        if parsed.category not in ordered_categories:
+            ordered_categories.append(parsed.category)
+    checks_by_category = {category: _maybe_over_limit_call(category) for category in ordered_categories}
+    limit_checks = [checks_by_category[category] for category in ordered_categories]
+    results = [
+        {"expense": expense, "limitCheck": checks_by_category[parsed.category]}
+        for expense, parsed in zip(expenses, parsed_items)
+    ]
+    engines = [parsed.engine for parsed in parsed_items]
+    engine = engines[0]
+    if len(set(engines)) > 1:
+        engine = "nemotron" if "nemotron" in engines else engines[0]
+
+    return {
+        "expense": expenses[0],
+        "expenses": expenses,
+        "results": results,
+        "limitCheck": _pick_limit_check(limit_checks),
+        "limitChecks": limit_checks,
+        "parse": {
+            "engine": engine,
+            "textEngine": text_engine,
+            "swap": swap,
+            "itemCount": len(expenses),
+        },
+    }
 
 
 @app.post("/log-expense")
@@ -336,35 +617,150 @@ async def log_expense(
     file: UploadFile | None = File(None),
     text: str | None = Form(None),
 ) -> dict[str, Any]:
-    """Voice or receipt → persist expense → run the weekly limit check."""
-    upload, filename = await _read_upload(file)
+    """Voice or receipt → persist expense(s) → run the weekly limit check.
+
+    Voice transcripts may list multiple spends in one take. Each item becomes
+    its own ledger row. ``expense`` is the first row (backward compatible);
+    ``expenses`` / ``results`` list every row.
+    """
+    upload, filename, content_type = await _read_upload(file)
+    started = time.perf_counter()
     try:
-        original, engine = _original_text(source=source, text=text, upload=upload, filename=filename)
-        parsed = parse_expense(original)
-        expense = insert_expense(
-            original_text=parsed.original_text,
+        if source == "receipt" and upload and _looks_like_image(filename, upload, content_type):
+            suffix = Path(filename).suffix.lower() if filename else ""
+            if suffix not in IMAGE_SUFFIXES:
+                suffix = ".jpg"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(upload)
+                tmp_path = tmp.name
+            try:
+                parsed = parse_receipt_image(tmp_path)
+            finally:
+                with suppress(OSError):
+                    os.unlink(tmp_path)
+            logger.info(
+                "log-expense source=receipt vision_ms=%.0f amount_cents=%s",
+                (time.perf_counter() - started) * 1000,
+                parsed.amount_cents,
+            )
+            return _expense_payload(
+                [parsed],
+                source,
+                "receipt",
+                "ai.receipt.categorize_receipt (nvidia/nemotron-3-nano-omni vision).",
+            )
+
+        stt_started = time.perf_counter()
+        original, engine = _original_text(
             source=source,
-            merchant=parsed.merchant,
-            amount_cents=parsed.amount_cents,
-            category=parsed.category,
-            confidence=parsed.confidence,
-            needs_review=parsed.needs_review,
+            text=text,
+            upload=upload,
+            filename=filename,
+            content_type=content_type,
         )
-        limit_check = _maybe_over_limit_call(parsed.category)
-        return {
-            "expense": expense,
-            "limitCheck": limit_check,
-            "parse": {
-                "engine": "heuristic",
-                "textEngine": engine,
-                "swap": "Replace categorizer.parse_expense with Nemotron; same ParsedExpense fields.",
-            },
-        }
+        stt_ms = (time.perf_counter() - stt_started) * 1000
+        parse_started = time.perf_counter()
+        if source == "voice":
+            parsed_items = parse_expenses(original)
+        else:
+            parsed_items = [parse_expense(original)]
+        parse_ms = (time.perf_counter() - parse_started) * 1000
+        logger.info(
+            "log-expense source=%s stt_ms=%.0f nemotron_ms=%.0f textEngine=%s parseEngine=%s itemCount=%s",
+            source,
+            stt_ms,
+            parse_ms,
+            engine,
+            parsed_items[0].engine,
+            len(parsed_items),
+        )
+        return _expense_payload(
+            parsed_items,
+            source,
+            engine,
+            "ai.categorize.categorize_expenses (voice lists) or categorize_expense "
+            "when NVIDIA_API_KEY is set; heuristic split/fallback otherwise.",
+        )
+    except UnknownAmountError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("log-expense failed")
         raise HTTPException(status_code=500, detail=f"Could not log expense: {exc}") from exc
+
+
+PARSE_LIMIT_SAVE_CONFIDENCE = 0.6
+
+
+def parse_limit_text(text: str) -> dict[str, Any]:
+    """Same result as ``POST /parse-limit``. Does not persist."""
+    from ai.spoken_limit import understand_spoken_limit
+
+    try:
+        parsed = understand_spoken_limit(text)
+    except Exception:
+        logger.exception("spoken limit parse failed")
+        parsed = {
+            "category": None,
+            "amount_cents": None,
+            "period": "weekly",
+            "confidence": 0.0,
+        }
+
+    if not isinstance(parsed, dict):
+        parsed = {
+            "category": None,
+            "amount_cents": None,
+            "period": "weekly",
+            "confidence": 0.0,
+        }
+
+    category = parsed.get("category")
+    if category not in CATEGORIES:
+        category = None
+
+    amount_cents = parsed.get("amount_cents")
+    if isinstance(amount_cents, bool) or amount_cents is None:
+        amount_cents = None
+    elif isinstance(amount_cents, int):
+        amount_cents = amount_cents if amount_cents >= 0 else None
+    elif isinstance(amount_cents, float) and abs(amount_cents - round(amount_cents)) <= 1e-6:
+        coerced = int(round(amount_cents))
+        amount_cents = coerced if coerced >= 0 else None
+    else:
+        amount_cents = None
+
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence != confidence:
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    ready = (
+        category is not None
+        and amount_cents is not None
+        and confidence >= PARSE_LIMIT_SAVE_CONFIDENCE
+    )
+    return {
+        "category": category,
+        "amount_cents": amount_cents,
+        "period": "weekly",
+        "confidence": confidence,
+        "readyToSave": ready,
+        "saveHint": (
+            "POST /limits with {category, limitCents: amount_cents} when readyToSave is true. "
+            "This endpoint does not persist."
+        ),
+    }
+
+
+@app.post("/parse-limit")
+def parse_limit(body: ParseLimitBody) -> dict[str, Any]:
+    """Parse spoken limit text. Does not save. High-confidence results can POST /limits."""
+    return parse_limit_text(body.text)
 
 
 @app.post("/limits")
@@ -420,8 +816,8 @@ def trigger_call(body: TriggerCallBody) -> dict[str, Any]:
         total = week_total_for_category(body.category, week_start=week_start)
         over_by = max(0, total - limit)
         spoken = over_limit_speech(body.category, total, limit, over_by)
-        settings = get_settings()
-        call = place_call(settings.get("phoneNumber"), spoken)
+        dest = _call_destination(body.phoneNumber)
+        call = place_call(dest, spoken)
         logged = log_call(
             kind="over_limit",
             category=body.category,
@@ -438,11 +834,13 @@ def trigger_call(body: TriggerCallBody) -> dict[str, Any]:
             "limitCents": limit,
             "overByCents": over_by,
             "message": spoken,
+            "to": dest,
             "calledAt": logged["calledAt"],
             "error": call.get("error"),
         }
 
-    result = place_weekly_summary_call(force=True)
+    result = place_weekly_summary_call(force=True, phone_number=body.phoneNumber)
+    call = result.get("call") or {}
     return {
         "ok": bool(result.get("ok")),
         "kind": "weekly_summary",
@@ -450,7 +848,8 @@ def trigger_call(body: TriggerCallBody) -> dict[str, Any]:
         "message": result.get("message"),
         "weekTotalCents": result.get("weekTotalCents"),
         "totalsByCategory": result.get("totalsByCategory"),
-        "calledAt": (result.get("call") or {}).get("calledAt"),
+        "to": call.get("to"),
+        "calledAt": call.get("calledAt"),
         "error": result.get("error"),
     }
 

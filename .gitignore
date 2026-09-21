@@ -6,8 +6,10 @@ __pycache__/
 *.db
 *.sqlite3
 *.mp3
+*.ulaw
 *.m4a
 .expo/
 venv/
 .venv/
 backend/__pycache__/
+backend/call_audio/

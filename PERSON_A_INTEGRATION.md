@@ -68,6 +68,45 @@ await fetch(`${API_BASE_URL}/settings`, {
 });
 ```
 
+### Parse a spoken weekly limit (does not save)
+
+```js
+const res = await fetch(`${API_BASE_URL}/parse-limit`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ text: 'cap my food spending at a hundred a week' }),
+});
+const parsed = await res.json();
+// parsed.category, parsed.amount_cents, parsed.period, parsed.confidence, parsed.readyToSave
+// If parsed.readyToSave, then POST /limits with { category, limitCents: amount_cents }
+```
+
+### Trigger a weekly summary call (optional one-time number)
+
+```js
+await fetch(`${API_BASE_URL}/trigger-call`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ kind: 'weekly_summary', phoneNumber: '+1XXXXXXXXXX' }),
+});
+```
+
+`phoneNumber` is optional. When set, the backend dials that number once and does not change saved Settings. Trial Twilio accounts can dial only verified numbers.
+
+### Log a receipt photo
+
+```js
+const form = new FormData();
+form.append('source', 'receipt');
+form.append('file', { uri, name: 'receipt.jpg', type: 'image/jpeg' });
+
+const res = await fetch(`${API_BASE_URL}/log-expense`, {
+  method: 'POST',
+  body: form,
+});
+// HTTP 400 if the vision model cannot read a total — do not invent cents
+```
+
 ### Log expense (until mic works — text form field)
 
 ```js
@@ -80,7 +119,8 @@ const res = await fetch(`${API_BASE_URL}/log-expense`, {
   body: form,
 });
 const data = await res.json();
-// data.expense, data.limitCheck
+// data.expense (first row, always present on success), data.expenses (all rows),
+// data.limitCheck (one representative over-limit check for the batch)
 ```
 
 ## 4. Rules (don’t break these)

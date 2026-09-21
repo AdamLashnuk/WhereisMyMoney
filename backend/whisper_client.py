@@ -1,17 +1,21 @@
 """Audio → text.
 
 Tries a real transcriber when ``WHISPER_STUB`` is not ``1``:
-1. OpenAI Whisper API if ``OPENAI_API_KEY`` is set and the ``openai`` package exists
-2. Local ``whisper`` (openai-whisper) if installed
+1. ElevenLabs Scribe if ``ELEVENLABS_API_KEY`` is set
+2. OpenAI Whisper API if ``OPENAI_API_KEY`` is set and the ``openai`` package exists
+3. Local ``whisper`` (openai-whisper) if installed
 
 Falls back to a deterministic stub so the server never crashes without a model.
 Set ``WHISPER_STUB=1`` to force the stub (recommended for laptop demos).
+Live ElevenLabs Scribe requires ``WHISPER_STUB=0`` (or unset) and ``ELEVENLABS_API_KEY``.
 """
 
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
+import time
 from pathlib import Path
 
 logger = logging.getLogger("whereismymoney.whisper")
@@ -19,15 +23,58 @@ logger = logging.getLogger("whereismymoney.whisper")
 STUB_VOICE_TEXT = "spent fourteen bucks on lunch"
 STUB_RECEIPT_TEXT = "RECEIPT TOTAL 14.00 LUNCH"
 
+ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+DEFAULT_ELEVENLABS_MODEL = "scribe_v2"
+DEFAULT_ELEVENLABS_TIMEOUT_S = 20.0
+_AUDIO_MIME = {
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".aac": "audio/aac",
+    ".mp3": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".webm": "audio/webm",
+    ".flac": "audio/flac",
+    ".caf": "audio/x-caf",
+}
+
 
 def whisper_stub_enabled() -> bool:
     return os.getenv("WHISPER_STUB", "").strip() in {"1", "true", "True", "yes", "YES"}
 
 
-def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, str]:
-    """Return ``(text, engine)`` where engine is ``stub``, ``openai``, or ``local``.
+def _audio_mime(path: Path, content_type: str = "") -> str:
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype == "video/mp4":
+        return "audio/mp4"
+    if ctype.startswith("audio/"):
+        return ctype
+    guessed = mimetypes.guess_type(path.name)[0]
+    if guessed:
+        return guessed
+    return _AUDIO_MIME.get(path.suffix.lower(), "application/octet-stream")
+
+
+def _upload_name(path: Path, filename: str = "") -> str:
+    raw = (filename or "").strip() or path.name
+    name = Path(raw).name or path.name
+    if Path(name).suffix:
+        return name
+    return path.name or "expense.m4a"
+
+
+def transcribe_audio(
+    path: str | Path,
+    *,
+    source: str = "voice",
+    content_type: str = "",
+    filename: str = "",
+) -> tuple[str, str]:
+    """Return ``(text, engine)``: ``elevenlabs``, ``openai``, ``local``, or ``stub``.
 
     Never raises on missing models or keys — returns the stub instead.
+    Live STT requires ``WHISPER_STUB=0`` (or unset) and ``ELEVENLABS_API_KEY``.
     """
     fallback = STUB_VOICE_TEXT if source == "voice" else STUB_RECEIPT_TEXT
     if whisper_stub_enabled():
@@ -39,16 +86,85 @@ def transcribe_audio(path: str | Path, *, source: str = "voice") -> tuple[str, s
         logger.warning("No audio bytes at %s; using stub", audio_path)
         return fallback, "stub"
 
+    started = time.perf_counter()
+    elevenlabs_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    text = _try_elevenlabs(audio_path, content_type=content_type, filename=filename)
+    if text:
+        logger.info("STT engine=elevenlabs ms=%.0f", (time.perf_counter() - started) * 1000)
+        return text, "elevenlabs"
+    if elevenlabs_key:
+        # Key is configured: do not cascade into a second STT engine (extra latency).
+        logger.info(
+            "STT engine=stub ms=%.0f (ElevenLabs configured; skipping extra engines)",
+            (time.perf_counter() - started) * 1000,
+        )
+        return fallback, "stub"
+
     text = _try_openai(audio_path)
     if text:
+        logger.info("STT engine=openai ms=%.0f", (time.perf_counter() - started) * 1000)
         return text, "openai"
 
     text = _try_local_whisper(audio_path)
     if text:
+        logger.info("STT engine=local ms=%.0f", (time.perf_counter() - started) * 1000)
         return text, "local"
 
-    logger.info("No Whisper backend available; using stub transcription")
+    logger.info("No speech-to-text backend available; using stub transcription")
     return fallback, "stub"
+
+
+def _try_elevenlabs(path: Path, *, content_type: str = "", filename: str = "") -> str | None:
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        import httpx
+    except ImportError:
+        logger.info("httpx package not installed; skip ElevenLabs STT")
+        return None
+    model_id = os.getenv("ELEVENLABS_STT_MODEL", "").strip() or DEFAULT_ELEVENLABS_MODEL
+    mime = _audio_mime(path, content_type)
+    upload_name = _upload_name(path, filename)
+    timeout_s = DEFAULT_ELEVENLABS_TIMEOUT_S
+    raw_timeout = os.getenv("ELEVENLABS_STT_TIMEOUT", "").strip()
+    if raw_timeout:
+        try:
+            timeout_s = max(5.0, min(60.0, float(raw_timeout)))
+        except ValueError:
+            timeout_s = DEFAULT_ELEVENLABS_TIMEOUT_S
+    started = time.perf_counter()
+    try:
+        with path.open("rb") as handle:
+            response = httpx.post(
+                ELEVENLABS_STT_URL,
+                headers={"xi-api-key": api_key},
+                data={"model_id": model_id, "language_code": "eng"},
+                files={"file": (upload_name, handle, mime)},
+                timeout=timeout_s,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if not isinstance(payload, dict):
+            logger.warning("ElevenLabs STT non-object JSON in %.0fms", elapsed_ms)
+            return None
+        text = (payload.get("text") or "").strip()
+        logger.info(
+            "ElevenLabs STT %s in %.0fms bytes=%s model=%s",
+            "ok" if text else "empty",
+            elapsed_ms,
+            path.stat().st_size,
+            model_id,
+        )
+        return text or None
+    except Exception as exc:
+        logger.warning(
+            "ElevenLabs STT failed in %.0fms: %s",
+            (time.perf_counter() - started) * 1000,
+            exc,
+        )
+        return None
 
 
 def _try_openai(path: Path) -> str | None:
