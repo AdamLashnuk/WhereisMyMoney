@@ -148,4 +148,4 @@ Built at SteelHacks XIII by a three-person team (frontend / backend / AI) agains
 
 ## License
 
-Hackathon project — see repository owners for reuse.
+Feel free to use.
