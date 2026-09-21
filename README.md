@@ -88,17 +88,63 @@ ngrok http 8000
 
 Without `PUBLIC_BASE_URL`, calls fall back to trial-safe Twimlets `<Say>`.
 
-### 4. Expo app
+### 4. Phone app (Expo Go)
+
+You need **two machines roles** (can be the same laptop): (1) a computer running Metro + the FastAPI backend, (2) a phone with Expo Go.
+
+**On the phone**
+
+1. Install **Expo Go** from the App Store (iOS) or Play Store (Android).
+2. Connect the phone to the **same Wi‑Fi** as the computer running the backend (LAN mode is simplest for a hackathon demo).
+
+**On the computer**
+
+1. Keep the backend running on port `8000` (step 2 above).
+2. Find your computer’s LAN IP (examples):
+   - macOS: System Settings → Network, or `ipconfig getifaddr en0`
+   - Linux: `hostname -I` / `ip a`
+   - Windows: `ipconfig` (IPv4 address)
+3. Point the app at that backend:
 
 ```bash
 cd app
 npm install
-# edit config.js → API_BASE_URL = 'http://<your-lan-ip>:8000'
-# or your ngrok HTTPS origin if the phone is off your LAN
+```
+
+Edit `app/config.js`:
+
+```js
+export const API_BASE_URL = 'http://YOUR_LAN_IP:8000';
+// example: 'http://10.5.45.55:8000'
+```
+
+If the phone cannot reach your LAN IP, set `API_BASE_URL` to your **ngrok HTTPS** origin instead (same value as `PUBLIC_BASE_URL`, no trailing slash).
+
+4. Start the Expo freestanding Metro server (clears cache):
+
+```bash
+cd app
 npx expo start -c
 ```
 
-Open in **Expo Go** on a phone on the same Wi‑Fi (or use the tunnel). Person A integration notes: `PERSON_A_INTEGRATION.md`.
+5. In the terminal / browser Expo UI, open the project on the phone:
+   - Scan the **QR code** with Expo Go (Android) or the Camera app (iOS), **or**
+   - Type the connection URL Expo prints.
+
+6. Confirm the phone can talk to the API: in the app, health/history should load; or from the computer:
+
+```bash
+curl -s http://YOUR_LAN_IP:8000/health
+```
+
+**Common gotchas**
+
+- Backend must be listening on `0.0.0.0:8000` (not only `127.0.0.1`) so the phone can reach it.
+- Phone and laptop must share a network that allows device-to-device traffic (some guest/venue Wi‑Fi blocks this — use hotspot or ngrok).
+- After changing `config.js` or pulling new JS, restart with `npx expo start -c` and reload Expo Go.
+- Voice/receipt uploads need a live backend with keys set; Twilio calls also need ngrok + `PUBLIC_BASE_URL` (step 3).
+
+More detail for the original frontend wiring: `PERSON_A_INTEGRATION.md`.
 
 ---
 
